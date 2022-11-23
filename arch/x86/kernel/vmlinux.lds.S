@@ -580,4 +580,8 @@ INIT_PER_CPU(irq_stack_backing_store);
 . = ASSERT(its_return_thunk & 0x20, "its_return_thunk not in second half of cacheline");
 #endif
 
+#ifdef CONFIG_PKVM_INTEL
+#include <asm/pkvm_image_vars.h>
+#endif
+
 #endif /* CONFIG_X86_64 */
