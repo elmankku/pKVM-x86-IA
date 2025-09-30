@@ -372,7 +372,7 @@ void __cpuidle tdx_halt(void)
 		WARN_ONCE(1, "HLT instruction emulation failed\n");
 }
 
-static void __cpuidle tdx_safe_halt(void)
+void __cpuidle tdx_safe_halt(void)
 {
 	tdx_halt();
 	/*
@@ -661,7 +661,7 @@ static int virt_exception_kernel(struct pt_regs *regs, struct ve_info *ve)
 	}
 }
 
-static bool tdx_handle_virt_exception(struct pt_regs *regs, struct ve_info *ve)
+bool tdx_handle_virt_exception(struct pt_regs *regs, struct ve_info *ve)
 {
 	int insn_len;
 
