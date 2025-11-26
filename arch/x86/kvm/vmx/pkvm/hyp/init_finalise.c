@@ -299,6 +299,7 @@ static int create_iommu(void)
 	return pkvm_init_iommu(pkvm_virt_to_phys(iommu_mem_base), nr_pages);
 }
 
+#if IS_ENABLED(CONFIG_PKVM_INTEL_DEBUG)
 static int create_host_vm(struct kvm_vcpu *vcpu)
 {
 	struct kvm_memslots *slots;
@@ -330,7 +331,7 @@ static int create_host_vm(struct kvm_vcpu *vcpu)
 	}
 	rcuwait_init(&host_kvm->mn_memslots_update_rcuwait);
 
-	for (i = 0; i < kvm_arch_nr_memslot_as_ids(kvm); i++) {
+	for (i = 0; i < kvm_arch_nr_memslot_as_ids(host_kvm); i++) {
 		for (j = 0; j < 2; j++) {
 			slots = &host_kvm->__memslots[i][j];
 
@@ -341,13 +342,13 @@ static int create_host_vm(struct kvm_vcpu *vcpu)
 			slots->node_idx = j;
 			slots->generation = i; /*yes, must be different */
 		}
-	}
 
-	/* the default active set = 0 */
-	rcu_assign_pointer(host_kvm->memslots[0], &host_kvm->__memslots[0][0]);
-	rcu_assign_pointer(host_kvm->memslots[1], &host_kvm->__memslots[0][1]);
-	kvm_info("pkvm: memslots 0x%llx (A), 0x%llx (I)",
-		 (u64)host_kvm->memslots[0], (u64)host_kvm->memslots[1]);
+		/* the default active set = 0 */
+		rcu_assign_pointer(host_kvm->memslots[i],
+				   &host_kvm->__memslots[i][0]);
+		pkvm_info("pkvm: memslot 0x%llx %s\n",
+			 (u64) host_kvm->memslots[i], i == 0 ? "(A)" : "(I)");
+	}
 
 	/* Set them up */
 	for (i = 0; i < hyp_memblock_nr; i++) {
@@ -383,6 +384,7 @@ out:
 
 	return ret;
 }
+#endif
 
 #define TMP_SECTION_SZ	16UL
 int __pkvm_init_finalise(struct kvm_vcpu *vcpu, struct pkvm_section sections[],
@@ -446,11 +448,13 @@ int __pkvm_init_finalise(struct kvm_vcpu *vcpu, struct pkvm_section sections[],
 	if (ret)
 		goto out;
 
+#if IS_ENABLED(CONFIG_PKVM_INTEL_DEBUG)
 	ret = create_host_vm(vcpu);
 	if (ret) {
 		pkvm_err("pkvm: unable to create host vm");
 		goto out;
 	}
+#endif
 
 	ret = protect_pkvm_pages(tmp_sections, section_sz,
 			hyp_mem_base, hyp_mem_size);
@@ -509,9 +513,11 @@ switch_pgt:
 	ret = pkvm_setup_lapic(pcpu, vcpu->cpu);
 	barrier();
 
+#if IS_ENABLED(CONFIG_PKVM_INTEL_DEBUG)
 	pkvm_info("Protected host configuration complete on cpu with info:\n");
 	pkvm_info("%s", debug_dump_vmcs());
 	print_guest_maps(vcpu, d_s);
+#endif
 
 out:
 	barrier();

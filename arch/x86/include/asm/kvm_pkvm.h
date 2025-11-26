@@ -273,6 +273,7 @@ static inline int pkvm_vm_ioctl_enable_cap(struct kvm *kvm, struct kvm_enable_ca
 unsigned long guest_ept_lookup(struct kvm_vcpu *vcpu, u64 eptp, u64 gpa, u64 *spte, int *);
 unsigned long guest_pgt_lookup(struct kvm_vcpu *vcpu, unsigned long vaddr);
 
+#ifdef CONFIG_PKVM_INTEL_DEBUG
 int print_host_maps(void);
 int print_guest_maps(struct kvm_vcpu *vcpu, dtype_t);
 #else
@@ -316,5 +317,6 @@ static __maybe_unused int __hyp_vcpu_write_guest_page(struct kvm_vcpu *vcpu,
 						      struct kvm_memory_slot *slot, gfn_t gfn,
 						      const void *data, int offset, int len)
 	{ return -ENOTSUPP; }
-#endif
-#endif
+#endif /* CONFIG_PKVM_INTEL_VMXROOT_MMIO */
+#endif /* CONFIG_PKVM_INTEL */
+#endif /* _ASM_X86_KVM_PKVM_H */

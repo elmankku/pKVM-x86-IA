@@ -409,6 +409,7 @@ unsigned long guest_pgt_lookup(struct kvm_vcpu *vcpu, unsigned long vaddr)
 	return phys;
 }
 
+#if IS_ENABLED(CONFIG_PKVM_INTEL_DEBUG)
 /*
  * Temporary debugger extensions - not for code use
  */
@@ -604,3 +605,4 @@ int print_guest_maps(struct kvm_vcpu *vcpu, dtype_t dt)
 	}
 	return __print_guest_maps(vcpu, dt);
 }
+#endif
