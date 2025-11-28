@@ -249,8 +249,7 @@ static int hyp_check_owner(struct shadow_vcpu_state *shadow_vcpu, unsigned long 
 		return -EINVAL;
 
 	id = pkvm_page_owner(phys);
-	if (id != to_shadow_vm_handle(shadow_vcpu->shadow_vcpu_handle))
-		panic("illegal guest read or write\n");
+	PKVM_ASSERT(id == to_shadow_vm_handle(shadow_vcpu->shadow_vcpu_handle));
 
 	return 0;
 }

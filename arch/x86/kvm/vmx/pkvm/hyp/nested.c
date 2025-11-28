@@ -16,6 +16,7 @@
 #include "debug.h"
 #include "mem_protect.h"
 #include "ve_emulation.h"
+#include "bug.h"
 
 /*
  * Not support shadow vmcs & vmfunc;
@@ -461,9 +462,7 @@ static noinline bool check_vmx_permission(struct kvm_vcpu *vcpu)
 		return false;
 
 	/* The host context must be static (vmcs01 + right ept).. */
-	if (vmcs_read64(EPT_POINTER) != host_eptp)
-		panic("%s: entering emulated call from unknown context?\n",
-			__func__);
+	PKVM_ASSERT(vmcs_read64(EPT_POINTER) == host_eptp);
 
 	/* And the virtualization must be enabled .. */
 	asm("mov %%cr4,%0" : "=r"(cr4));
