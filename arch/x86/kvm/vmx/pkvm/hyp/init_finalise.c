@@ -40,7 +40,7 @@ void *pkvm_vmemmap_base;
 void *host_ept_pgt_base;
 static void *iommu_mem_base;
 static void *shadow_ept_base;
-DEFINE_SPINLOCK(pkvm_init_lock);
+static pkvm_spinlock_t pkvm_init_lock = __PKVM_SPINLOCK_UNLOCKED;
 static struct kvm *host_kvm;
 
 static int divide_memory_pool(phys_addr_t phys, unsigned long size)
@@ -399,7 +399,7 @@ int __pkvm_init_finalise(struct kvm_vcpu *vcpu, struct pkvm_section sections[],
 	phys_addr_t hyp_mem_base;
 	unsigned long hyp_mem_size = 0;
 
-	spin_lock(&pkvm_init_lock);
+	pkvm_spin_lock(&pkvm_init_lock);
 	if (pkvm_init) {
 		/* Switch to pkvm mmu in root mode in case some setup may need this */
 		native_write_cr3(pkvm_hyp->mmu->root_pa);
@@ -521,7 +521,7 @@ switch_pgt:
 
 out:
 	barrier();
-	spin_unlock(&pkvm_init_lock);
+	pkvm_spin_unlock(&pkvm_init_lock);
 
 	return ret;
 }
