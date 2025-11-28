@@ -95,6 +95,7 @@ static inline int vmptrst(uint64_t *value)
 static int pkvm_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
 				    int et, void *insn, int ilen)
 {
+#if IS_ENABLED(CONFIG_PKVM_INTEL_VMXROOT_MMIO)
 	struct shadow_vcpu_state *shadow_vcpu;
 	u64 vmptr;
 	int ret;
@@ -115,11 +116,15 @@ static int pkvm_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
 	put_shadow_vcpu(vcpu->pkvm_shadow_vcpu_handle);
 
 	return ret;
+#else
+	return -ENOTSUPP;
+#endif
 }
 
 static int pkvm_inject_events(struct kvm_vcpu *vcpu,
 			      bool *req_immediate_exit)
 {
+#if IS_ENABLED(CONFIG_PKVM_INTEL_VMXROOT_MMIO)
 	struct shadow_vcpu_state *shadow_vcpu;
 	u64 vmptr;
 	int ret;
@@ -140,6 +145,9 @@ static int pkvm_inject_events(struct kvm_vcpu *vcpu,
 	put_shadow_vcpu(vcpu->pkvm_shadow_vcpu_handle);
 
 	return ret;
+#else
+	return -ENOTSUPP;
+#endif
 }
 
 static unsigned long handle_vmcall(struct kvm_vcpu *vcpu)
