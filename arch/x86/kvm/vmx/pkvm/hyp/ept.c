@@ -380,7 +380,7 @@ static void inject_guest_gpf(void)
 
 static void handle_permission_violation(struct kvm_vcpu *vcpu)
 {
-	unsigned long gla = vmcs_readl(GUEST_LINEAR_ADDRESS);
+	unsigned long gla __maybe_unused = vmcs_readl(GUEST_LINEAR_ADDRESS);
 	unsigned long gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS);
 	unsigned long eip = vmcs_readl(GUEST_RIP);
 	unsigned long cr3 = vmcs_readl(GUEST_CR3);
