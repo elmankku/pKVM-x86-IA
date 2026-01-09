@@ -275,6 +275,10 @@ int pkvm_main(struct kvm_vcpu *vcpu)
 	int launch = 1;
 	int ret;
 
+#if IS_ENABLED(CONFIG_PKVM_INTEL_DEBUG)
+	pkvm_gdb_enable_stack_exec();
+#endif
+
 	vcpu->mode = IN_GUEST_MODE;
 
 	/*

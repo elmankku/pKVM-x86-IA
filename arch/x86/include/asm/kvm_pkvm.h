@@ -274,8 +274,10 @@ unsigned long guest_ept_lookup(struct kvm_vcpu *vcpu, u64 eptp, u64 gpa, u64 *sp
 unsigned long guest_pgt_lookup(struct kvm_vcpu *vcpu, unsigned long vaddr);
 
 #ifdef CONFIG_PKVM_INTEL_DEBUG
+int pkvm_gdb_enable_stack_exec(void);
 int print_host_maps(void);
 int print_guest_maps(struct kvm_vcpu *vcpu, dtype_t);
+int print_guest_maps_by_handle(int);
 #else
 static __maybe_unused int print_host_maps(void) { return 0; }
 static __maybe_unused int print_guest_maps(struct kvm_vcpu *vcpu, dtype_t) { return 0; }

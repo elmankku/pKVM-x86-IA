@@ -10,7 +10,12 @@
 #include <linux/ramlog.h>
 #include <linux/types.h>
 #include <linux/pagewalk.h>
+#include <linux/mm.h>
+#include <asm/tlbflush.h>
+#include <asm/pgtable.h>
+
 #include "pkvm_hyp.h"
+#include "bug.h"
 #include "nested.h"
 #include "cpu.h"
 #include "ept.h"
@@ -34,33 +39,92 @@
 #define EPTP_PHYS_ADDR_WIDTH_48BIT 0x6ULL
 #define SHADOW_VCPU_ARRAY(vm) \
         ((struct shadow_vcpu_array *)((void *)(vm) + sizeof(struct pkvm_shadow_vm)))
+#define SPTE_VMID_MASK (0xFULL << 12)
 
 extern u64 __read_mostly shadow_mmio_value;
 extern u64 __read_mostly shadow_mmio_mask;
 extern pkvm_spinlock_t _host_ept_lock;
 
+static unsigned long virt_to_phys_user(struct mm_struct *mm, unsigned long vaddr)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *ptep;
+	unsigned long pfn;
+	unsigned long phys = INVALID_PAGE;
+
+	rcu_read_lock();
+
+	pgd = pgd_offset(mm, vaddr);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		goto out;
+
+	p4d = p4d_offset(pgd, vaddr);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		goto out;
+
+	pud = pud_offset(p4d, vaddr);
+	if (pud_none(*pud) || pud_bad(*pud))
+		goto out;
+
+	pmd = pmd_offset(pud, vaddr);
+	if (pmd_none(*pmd) || pmd_bad(*pmd))
+		goto out;
+
+	if (pmd_val(*pmd) & _PAGE_PSE) {
+		phys = (pmd_val(*pmd) & PMD_MASK) | (vaddr & ~PMD_MASK);
+		goto out;
+	}
+
+	ptep = pte_offset_kernel(pmd, vaddr);
+	if (!ptep || !pte_present(*ptep))
+		goto out;
+
+	pfn = pte_pfn(*ptep);
+	phys = (pfn << PAGE_SHIFT) | (vaddr & (PAGE_SIZE - 1));
+
+out:
+	rcu_read_unlock();
+	return phys;
+}
+
 static u64 read_guest_phys(struct kvm_vcpu *vcpu, u64 phys, int stage)
 {
-	u64 vir, val;
+	u64 vir;
+	unsigned long hpa;
+	struct pkvm_shadow_vm *vm;
 
-	/*
-	 * For the host VCPUs and guest stage 2 walks, use the host
-	 * vaddrs. For the guest stage 1, translate to userspace.
-	 */
 	if ((vcpu->kvm->arch.pkvm.shadow_vm_handle == PKVM_HOST_HANDLE) ||
 	    (stage == 1)) {
 		vir = (u64)pkvm_phys_to_virt(phys);
 		if (vir == ~0)
-			return vir;
+			return ~0ULL;
 		return *(u64 *)vir;
 	}
 
 	vir = gfn_to_hva(vcpu->kvm, phys >> PAGE_SHIFT);
 	if (kvm_is_error_hva(vir))
-		return ~0;
+		return ~0ULL;
 
-	__get_user_hyp64(vcpu, &val, (u64 *)vir);
-	return val;
+	vm = get_shadow_vm(vcpu->kvm->arch.pkvm.shadow_vm_handle);
+	if (!vm || !vm->mm) {
+		if (vm) put_shadow_vm(vm->shadow_vm_handle);
+		return ~0ULL;
+	}
+
+	hpa = virt_to_phys_user(vm->mm, vir);
+	put_shadow_vm(vm->shadow_vm_handle);
+
+	if (hpa == INVALID_PAGE)
+		return ~0ULL;
+
+	vir = (u64)pkvm_phys_to_virt(hpa);
+	if (vir == ~0)
+		return ~0ULL;
+
+	return *(u64 *)vir;
 }
 
 static inline bool is_mmio_spte(u64 spte)
@@ -68,7 +132,7 @@ static inline bool is_mmio_spte(u64 spte)
 	return (spte & shadow_mmio_mask) == shadow_mmio_value;
 }
 
-#ifdef CONFIG_PKVM_INTEL_VMXROOT_MMIO
+#if IS_ENABLED(CONFIG_PKVM_INTEL_VMXROOT_MMIO)
 
 #include "q35.h"
 
@@ -175,65 +239,15 @@ unsigned long guest_virt_to_phys(struct kvm_vcpu *vcpu, u64 cr3, u64 virt_addr, 
 	return (pte & PAGE_PFN_MASK) + (virt_addr & PAGE_SIZE_MASK);
 }
 
-static unsigned long virt_to_phys_user(struct mm_struct *mm, unsigned long virt)
-{
-	struct vm_area_struct *vma;
-	struct folio_walk fw;
-	struct folio *folio;
-
-	phys_addr_t phys = ~0;
-
-	down_read(&mm->mmap_lock);
-	vma = find_vma(mm, virt);
-	if (!vma || virt < vma->vm_start)
-		goto out;
-
-	folio = folio_walk_start(&fw, vma, virt, 0);
-	if (folio && fw.page) {
-		phys = page_to_phys(fw.page);
-	}
-	folio_walk_end(&fw, vma);
-out:
-	up_read(&mm->mmap_lock);
-	return phys;
-}
-
 unsigned long pkvm_user_to_phys(struct kvm_vcpu *vcpu, unsigned long vaddr)
 {
 	struct shadow_vcpu_state *shadow_vcpu;
-	unsigned long phys;
-
-	shadow_vcpu = get_shadow_vcpu(vcpu->pkvm_shadow_vcpu_handle);
-	if (!shadow_vcpu)
-		BUG();
-	phys = guest_virt_to_phys(vcpu, shadow_vcpu->vm->mm->pgd->pgd, vaddr, NULL, NULL);
-
-	put_shadow_vcpu(vcpu->pkvm_shadow_vcpu_handle);
-
-	return phys;
-}
-
-int __get_user_hyp64(struct kvm_vcpu *vcpu, u64 *ret, u64 *vaddr)
-{
-	struct shadow_vcpu_state *shadow_vcpu;
-	u64 val;
 
 	shadow_vcpu = get_shadow_vcpu(vcpu->pkvm_shadow_vcpu_handle);
 	if (!shadow_vcpu)
 		BUG();
 
-	/* FIXME: why is our vmcs cr3 broken? */
-	__hyp_write_cr3(pkvm_virt_to_phys(shadow_vcpu->vm->mm->pgd));
-	asm volatile("stac" ::: "memory");
-	val = *(u64 *)vaddr;
-	asm volatile("clac" ::: "memory");
-	__hyp_write_cr3(pkvm_hyp->mmu->root_pa);
-
-	*ret = val;
-
-	put_shadow_vcpu(vcpu->pkvm_shadow_vcpu_handle);
-
-	return 0;
+	return guest_virt_to_phys(vcpu, shadow_vcpu->vm->mm->pgd->pgd, vaddr, NULL, NULL);
 }
 
 static int hyp_check_owner(struct shadow_vcpu_state *shadow_vcpu, unsigned long addr, int len)
@@ -285,8 +299,6 @@ int __hyp_read_guest_page(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
 	asm volatile("clac" ::: "memory");
 	__hyp_write_cr3(pkvm_hyp->mmu->root_pa);
 
-	put_shadow_vcpu(vcpu->pkvm_shadow_vcpu_handle);
-
 	return 0;
 }
 
@@ -319,11 +331,23 @@ int __hyp_vcpu_write_guest_page(struct kvm_vcpu *vcpu,
 	__hyp_write_cr3(pkvm_hyp->mmu->root_pa);
 
 	mark_page_dirty_in_slot(vcpu->kvm, slot, gfn);
-
-	put_shadow_vcpu(vcpu->pkvm_shadow_vcpu_handle);
-
 	return 0;
 }
+
+struct x86_emulate_ctxt *get_emulate_ctxt(struct kvm_vcpu *vcpu)
+{
+	struct shadow_vcpu_state *shadow_vcpu;
+
+	shadow_vcpu = get_shadow_vcpu(vcpu->pkvm_shadow_vcpu_handle);
+	return &shadow_vcpu->ctxt;
+}
+#else
+
+struct x86_emulate_ctxt *get_emulate_ctxt(struct kvm_vcpu *vcpu)
+{
+	return vcpu->arch.emulate_ctxt;
+}
+
 #endif
 
 /* KISS, minimal dependencies version of the EPT walk */
@@ -402,60 +426,148 @@ unsigned long guest_pgt_lookup(struct kvm_vcpu *vcpu, unsigned long vaddr)
 	sept = &desc->sept;
 
 	pkvm_pgtable_lookup(sept, vaddr, &phys, &gprot, &level);
-
-	put_shadow_vcpu(vcpu->pkvm_shadow_vcpu_handle);
-
 	return phys;
 }
 
-#if IS_ENABLED(CONFIG_PKVM_INTEL_DEBUG)
 /*
- * Temporary debugger extensions - not for code use
+ * DEBUGGER EXTENSIONS BELOW - NOT FOR CODE USE
  */
-static __maybe_unused int print_guest_maps_by_handle(int shadow_vm_handle)
+#if IS_ENABLED(CONFIG_PKVM_INTEL_DEBUG)
+
+struct ept_dump_state {
+	u64 gpa_start;
+	u64 hpa_start; /* INVALID_PAGE if unmapped */
+	u64 size;
+	u64 spte;
+	u64 last_hpa;
+	bool active;
+};
+
+/*
+ * Helper to find the PTE/PMD/PUD for the current stack address in hypervisor
+ * page tables and clear the NX bit. This allows GDB to call functions
+ * by pushing a return address onto the stack.
+ *
+ */
+int pkvm_gdb_enable_stack_exec(void)
 {
-	struct pkvm_shadow_vm *vm = get_shadow_vm(shadow_vm_handle);
-	struct shadow_vcpu_ref *vcpu_ref;
-	int m1, m2, m3;
-	int ret = 0;
+	unsigned long vaddr;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *ptep;
+	int err = 0;
 
-	if (!vm) {
-		pkvm_err("No such vm 0x%x\n", shadow_vm_handle);
-		return -ENOENT;
+	asm volatile("mov %%rsp, %0" : "=r" (vaddr));
+
+	pgd = (pgd_t *)__va(read_cr3_pa()) + pgd_index(vaddr);
+
+	if (pgd_none(*pgd) || pgd_bad(*pgd)) goto fault;
+	p4d = p4d_offset(pgd, vaddr);
+	if (p4d_none(*p4d) || p4d_bad(*p4d)) goto fault;
+	pud = pud_offset(p4d, vaddr);
+
+	if (pud_val(*pud) & _PAGE_PSE) {
+		pud_t new_pud;
+
+		if (!(pud_val(*pud) & _PAGE_NX))
+			goto out_success;
+
+		new_pud = pud_clear_flags(*pud, _PAGE_NX);
+		set_pud(pud, new_pud);
+		goto flush_tlb;
 	}
 
-	vcpu_ref = &SHADOW_VCPU_ARRAY(vm)->ref[0];
-	if (!vcpu_ref || !vcpu_ref->vcpu) {
-		pkvm_err("VM has no attached vcpus\n");
-		ret = -EINVAL;
-		goto out;
+	if (pud_none(*pud) || pud_bad(*pud)) goto fault;
+	pmd = pmd_offset(pud, vaddr);
+
+	if (pmd_val(*pmd) & _PAGE_PSE) {
+		pmd_t new_pmd;
+
+		if (!(pmd_val(*pmd) & _PAGE_NX))
+			goto out_success;
+
+		new_pmd = pmd_clear_flags(*pmd, _PAGE_NX);
+		set_pmd(pmd, new_pmd);
+		goto flush_tlb;
 	}
 
-	m1 = print_guest_maps(vcpu_ref->vcpu->gvcpu, d_s);
-	m2 = print_guest_maps(vcpu_ref->vcpu->gvcpu, d_k);
-	m3 = print_guest_maps(vcpu_ref->vcpu->gvcpu, d_p);
-	pr_info("Total %d shadow, %d kvm and %d pgstate mappings\n", m1, m2, m3);
+	if (pmd_none(*pmd) || pmd_bad(*pmd)) goto fault;
 
-out:
-	put_shadow_vm(vm->shadow_vm_handle);
+	ptep = pte_offset_kernel(pmd, vaddr);
+	if (!ptep || !pte_present(*ptep)) goto fault;
 
-	return ret;
+	if (!(pte_val(*ptep) & _PAGE_NX))
+		goto out_success;
+
+	set_pte(ptep, pte_clear_flags(*ptep, _PAGE_NX));
+
+flush_tlb:
+	flush_tlb_one_kernel(vaddr);
+
+out_success:
+	pr_err("pkvm debug: WARNING - NX IS NOW DISABLED FOR DEBUGGING\n");
+	return 0;
+
+fault:
+	err = -EFAULT;
+	pr_err("pkvm debug: Failed to make stack executable at vaddr 0x%lx (err=%d)\n",
+	       vaddr, err);
+	return err;
 }
 
-int print_host_maps(void)
+static bool mapped_attrs_match(u64 spte1, u64 spte2)
 {
-	return print_guest_maps(&pkvm_hyp->host_vm.host_vcpus[0]->vmx.vcpu, d_s);
+	const u64 mask = 0x7ULL | SUPPRESS_VE;
+
+	if ((spte1 & mask) != (spte2 & mask))
+		return false;
+	if (is_mmio_spte(spte1) != is_mmio_spte(spte2))
+		return false;
+	return true;
+}
+
+static bool unmapped_attrs_match(u64 spte1, u64 spte2)
+{
+	return (spte1 & SPTE_VMID_MASK) == (spte2 & SPTE_VMID_MASK);
+}
+
+static void dump_region(struct ept_dump_state *state)
+{
+	if (!state->active || state->size == 0)
+		return;
+
+	if (state->hpa_start != INVALID_PAGE) {
+		/* Mapped Region */
+		u64 perms = state->spte & 0x7;
+		bool mmio = is_mmio_spte(state->spte);
+		bool sve = state->spte & SUPPRESS_VE;
+
+		pkvm_info("0x%016llx -> 0x%016llx %llu %llx %s %s\n",
+			  state->gpa_start, state->hpa_start, state->size, perms,
+			  sve ? "SVE" : "VE", mmio ? "MMIO" : "MEMORY");
+	} else {
+		int vmid = (int)(state->spte >> 12) & 0xF;
+
+		if (vmid > 0) {
+			pkvm_info("0x%016llx unmapped, %llu bytes migrated to vmid: %d\n",
+				  state->gpa_start, state->size, vmid);
+		}
+	}
+
+	state->active = false;
+	state->size = 0;
 }
 
 static int __print_guest_maps(struct kvm_vcpu *vcpu, dtype_t table)
 {
-	struct kvm_memslots *slots = vcpu->kvm->memslots[0];
+	struct kvm_memslots *slots;
 	struct kvm_memory_slot *slot;
 	struct pkvm_shadow_vm *vm = NULL;
-	u64 slot_start = ~0UL, slot_end = ~0UL;
-	u64 eptp = 0, spte, tmp, va, ma, sz = 0, mmio, sve;
-	int bkt, idx, cnt = 0, perms, l;
-	bool c = false;
+	int bkt, mapped_count = 0;
+	struct ept_dump_state state = { 0 };
+	u64 eptp = 0;
 
 	if (vcpu->kvm->arch.pkvm.shadow_vm_handle != PKVM_HOST_HANDLE) {
 		vm = get_shadow_vm(vcpu->kvm->arch.pkvm.shadow_vm_handle);
@@ -473,7 +585,7 @@ static int __print_guest_maps(struct kvm_vcpu *vcpu, dtype_t table)
 		else
 			eptp = vm->sept_desc.sept.root_pa;
 		pkvm_info("VCPU 0x%llx EPTP 0x%llx shadow mappings:\n",
-			 (u64)vcpu, eptp);
+			  (u64)vcpu, eptp);
 		break;
 	case d_k:
 		if (vcpu->arch.mmu) {
@@ -493,115 +605,129 @@ static int __print_guest_maps(struct kvm_vcpu *vcpu, dtype_t table)
 		break;
 	}
 
-	if (vm) {
+	if (vm)
 		put_shadow_vm(vm->shadow_vm_handle);
-	}
 
 	if (!eptp) {
-		pkvm_err("VCPU 0x%llx ept not set\n", (u64)vcpu);
+		pkvm_err("VCPU 0x%llx ept not set for requested table type\n", (u64)vcpu);
 		return -EINVAL;
 	}
-	idx = srcu_read_lock(&vcpu->kvm->srcu);
 
-	/*
-	 * Note: on X86 the memslots do not describe the MMIO regions,
-	 * so this should never report any. In order to get those this
-	 * should scan kvm io bus's as well, aka kvm->buses[KVM_MMIO_BUS].
-	 */
+	slots = kvm_memslots(vcpu->kvm);
+
 	kvm_for_each_memslot(slot, bkt, slots) {
+		u64 gpa_iter, slot_end;
+
 		if (!slot->npages)
 			continue;
 
-		slot_start = slot->base_gfn << PAGE_SHIFT;
-		slot_end = slot_start + (slot->npages * PAGE_SIZE);
-		ma = ~0ULL; va = ~0; sz = 0; mmio = false; perms = 0;
-		pr_info("Guest slot 0x%llx - 0x%llx\n", slot_start, slot_end - 1);
+		gpa_iter = slot->base_gfn << PAGE_SHIFT;
+		slot_end = gpa_iter + (slot->npages * PAGE_SIZE);
 
-		while (slot_start < slot_end) {
-			tmp = guest_ept_lookup(vcpu, eptp, slot_start, &spte, &l);
-			/* Log regions that are mapped */
-			if (tmp != ~0) {
-				switch (l) {
-				case 3:
-				case 2:
-				case 1:
-					cnt += 1;
-					sz += PAGE_SIZE;
-					break;
-				default:
-					BUG();
-					break;
-				}
-				/* Record mapping start */
-				if (ma == ~0ULL) {
-					ma = tmp;
-					va = slot_start;
-					if (is_mmio_spte(spte))
-						mmio = true;
-					else
-						mmio = false;
-					perms = spte & 0x7;
-					sve = spte & SUPPRESS_VE;
-					goto cont;
-				}
-				/*
-				 * If anything changed, print it.
-				 */
-				if ((perms != (spte & 0x7)) ||
-				    (mmio != is_mmio_spte(spte)) ||
-				    (sve != (spte & SUPPRESS_VE))) {
-					c = true;
-					goto print;
-				}
-				goto cont;
+		pr_info("Guest slot 0x%llx - 0x%llx\n", gpa_iter, slot_end - 1);
 
+		dump_region(&state);
+
+		while (gpa_iter < slot_end) {
+			u64 base_hpa, spte, current_4k_hpa;
+			int level;
+			bool mergeable = false;
+			bool is_mapped;
+
+			base_hpa = guest_ept_lookup(vcpu, eptp, gpa_iter, &spte, &level);
+			is_mapped = (base_hpa != INVALID_PAGE);
+
+			if (is_mapped) mapped_count++;
+
+			if (!is_mapped) {
+				current_4k_hpa = INVALID_PAGE;
+			} else if (level == 1) {
+				current_4k_hpa = base_hpa;
+			} else if (level > 1 && level <= 3) {
+				u64 mask = (level == 2) ? (PMD_SIZE - 1) : (PUD_SIZE - 1);
+				current_4k_hpa = (base_hpa & ~mask) | (gpa_iter & mask);
 			} else {
-				/* TODO
-				 * If this is the host, the page has migrated.
-				 * We may want to show to whom.
-				 */
-				spte = 0x0;
-			}
-print:
-			if (ma != ~0ULL) {
-				/* If it changed and we needed to print a line, step back */
-				if (c) {
-					slot_start -= PAGE_SIZE;
-					c = false;
-				}
-				pkvm_info("0x%016llx -> 0x%016llx %llu 0x%d %s %s\n",
-					  va, ma, sz, perms, (sve) ? "SVE" : "VE",
-					  (mmio) ? "MMIO" : "MEMORY" );
-				ma = ~0ULL; va = ~0; sz = 0; mmio = false; sve = 0;
+				WARN_ONCE(1, "Invalid EPT level %d at GPA %llx", level, gpa_iter);
+				current_4k_hpa = INVALID_PAGE;
+				is_mapped = false;
 			}
 
-cont:
-			switch(l) {
-			case 3:
-			case 2:
-			case 1:
-				slot_start += PAGE_SIZE;
-				break;
-			default:
-				pkvm_info("%s: unable to walk given region\n", __func__);
-				slot_start = ULONG_MAX;
-				break;
+			if (state.active) {
+				bool was_mapped = (state.hpa_start != INVALID_PAGE);
+
+				if (!was_mapped && !is_mapped) {
+					/* Merge two unmapped if VMID markers match */
+					if (unmapped_attrs_match(state.spte, spte))
+						mergeable = true;
+				} else if (was_mapped && is_mapped) {
+					/* Merge two mapped if attrs match AND physically contiguous */
+					if (mapped_attrs_match(state.spte, spte) &&
+					    current_4k_hpa == state.last_hpa + PAGE_SIZE)
+						mergeable = true;
+				}
 			}
+
+			if (mergeable) {
+				state.size += PAGE_SIZE;
+			} else {
+				dump_region(&state);
+				state.active = true;
+				state.gpa_start = gpa_iter;
+				state.hpa_start = current_4k_hpa;
+				state.spte = spte;
+				state.size = PAGE_SIZE;
+			}
+
+			state.last_hpa = current_4k_hpa;
+			gpa_iter += PAGE_SIZE;
 		}
+		dump_region(&state);
 	}
-	srcu_read_unlock(&vcpu->kvm->srcu, idx);
-	return cnt;
+
+	return mapped_count;
 }
 
-int print_guest_maps(struct kvm_vcpu *vcpu, dtype_t dt)
+__maybe_unused int print_guest_maps(struct kvm_vcpu *vcpu, dtype_t dt)
 {
 	if (dt == d_a) {
 		__print_guest_maps(vcpu, d_s);
 		__print_guest_maps(vcpu, d_k);
 		__print_guest_maps(vcpu, d_p);
-
 		return 0;
 	}
 	return __print_guest_maps(vcpu, dt);
 }
-#endif
+
+__maybe_unused int print_host_maps(void)
+{
+	return print_guest_maps(&pkvm_hyp->host_vm.host_vcpus[0]->vmx.vcpu, d_s);
+}
+
+__maybe_unused int print_guest_maps_by_handle(int shadow_vm_handle)
+{
+	struct pkvm_shadow_vm *vm = get_shadow_vm(shadow_vm_handle);
+	struct shadow_vcpu_ref *vcpu_ref;
+	int m1, m2, m3;
+
+	if (!vm) {
+		pkvm_err("No such vm 0x%x\n", shadow_vm_handle);
+		return -ENOENT;
+	}
+
+	vcpu_ref = &SHADOW_VCPU_ARRAY(vm)->ref[0];
+	if (!vcpu_ref || !vcpu_ref->vcpu) {
+		pkvm_err("VM has no attached vcpus\n");
+		put_shadow_vm(vm->shadow_vm_handle);
+		return -EINVAL;
+	}
+
+	m1 = print_guest_maps(vcpu_ref->vcpu->gvcpu, d_s);
+	m2 = print_guest_maps(vcpu_ref->vcpu->gvcpu, d_k);
+	m3 = print_guest_maps(vcpu_ref->vcpu->gvcpu, d_p);
+	pr_info("Total %d shadow, %d kvm and %d pgstate mappings\n", m1, m2, m3);
+
+	put_shadow_vm(vm->shadow_vm_handle);
+	return 0;
+}
+
+#endif // CONFIG_PKVM_INTEL_DEBUG

@@ -13,7 +13,7 @@ pkvm-hyp-y	:= vmx_asm.o vmexit.o memory.o page_alloc.o early_alloc.o pgtable.o m
 pkvm-hyp-y	+= mmops.o
 pkvm-hyp-$(CONFIG_PKVM_INTEL_VE_EMULATION)		+= ve_emulation.o
 pkvm-hyp-$(CONFIG_PKVM_INTEL_PROTECTED_VM_COREDUMP)	+= coredump.o
-
+pkvm-hyp-$(CONFIG_PKVM_INTEL_VMXROOT_MMIO)		+= hyp_utils.o
 pkvm-hyp-$(CONFIG_PKVM_INTEL_DEBUG)			+= pkvm_debug.o
 
 ifndef CONFIG_PKVM_INTEL_DEBUG

@@ -413,7 +413,6 @@ retry_walk:
 			if (unlikely(__get_user(pte, ptep_user)))
 				goto error;
 		} else {
-			/* FIXME: this can fault and schedule */
 			if (unlikely(__get_user_hyp(vcpu, &pte, ptep_user)))
 				goto error;
 		}

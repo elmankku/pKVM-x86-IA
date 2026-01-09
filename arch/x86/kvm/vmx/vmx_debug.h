@@ -16,7 +16,7 @@ void debug_validate_vmcs_registers(void);
 #else
 static inline char *debug_dump_vmcs(void) { return NULL; }
 static inline char *debug_dump_vmx_msr_state(void) { return NULL; }
-static inline debug_validate_vmcs_registers(void) { }
+static inline void debug_validate_vmcs_registers(void) { }
 
 #define debug_validate_vmcs(...) do {} while (0)
 #endif
