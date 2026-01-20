@@ -85,7 +85,7 @@ static inline bool vmx_has_invvpid_global(void)
 static inline bool vmx_has_ept_violation_ve(void)
 {
 	return !!(PKVM_HYP->vmcs_config.cpu_based_2nd_exec_ctrl &
-						SECONDARY_EXEC_EPT_VIOLATION_VE);
+		  SECONDARY_EXEC_EPT_VIOLATION_VE);
 }
 
 static inline bool vmx_has_ept_violation_ve_emulation(void)

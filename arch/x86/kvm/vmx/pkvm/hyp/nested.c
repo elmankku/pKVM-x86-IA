@@ -30,6 +30,24 @@
 	 SECONDARY_EXEC_ENABLE_VMFUNC | 	\
 	 SECONDARY_EXEC_DESC)
 
+/* Bits that must be set/cleared for the guest. */
+#define NESTED_PIN_BASED_SET		(0)
+#define NESTED_PIN_BASED_CLR		(0)
+#define NESTED_CPU_BASED_SET		(CPU_BASED_USE_MSR_BITMAPS | \
+					 CPU_BASED_ACTIVATE_SECONDARY_CONTROLS)
+#define NESTED_CPU_BASED_CLR		(0)
+#define NESTED_SECONDARY_EXEC_SET	(SECONDARY_EXEC_ENABLE_EPT | \
+					 SECONDARY_EXEC_UNRESTRICTED_GUEST)
+#define NESTED_SECONDARY_EXEC_CLR	(NESTED_UNSUPPORTED_2NDEXEC)
+#define NESTED_VM_ENTRY_SET		(VM_ENTRY_LOAD_IA32_EFER | \
+					 VM_ENTRY_LOAD_IA32_PAT | \
+					 VM_ENTRY_LOAD_DEBUG_CONTROLS)
+#define NESTED_VM_ENTRY_CLR		(0)
+#define NESTED_VM_EXIT_SET		(VM_EXIT_LOAD_IA32_EFER | \
+					 VM_EXIT_LOAD_IA32_PAT | \
+					 VM_EXIT_HOST_ADDR_SPACE_SIZE)
+#define NESTED_VM_EXIT_CLR		(0)
+
 static const unsigned int vmx_msrs[] = {
 	LIST_OF_VMX_MSRS
 };
@@ -725,6 +743,58 @@ static void nested_release_vmcs12(struct kvm_vcpu *vcpu)
 	put_shadow_vcpu(cur_shadow_vcpu->shadow_vcpu_handle);
 }
 
+/*
+ * Checks bits that must be set and bits that must be cleared. The rest of
+ * the bits are ignored.
+ *
+ * set_mask[i] == 1: val[i] must be 1
+ * clr_mask[i] == 1: val[i] must be 0
+ */
+static inline bool nested_check_enforced_bits(u64 val, u64 set_mask, u64 clr_mask)
+{
+	return (val & (set_mask | clr_mask)) == set_mask;
+}
+
+/*
+ * Checks that the loaded VMCS maintains the isolation guarantees.
+ */
+static bool nested_check_vmcs(struct kvm_vcpu *vcpu)
+{
+	struct pkvm_host_vcpu *pkvm_hvcpu = to_pkvm_hvcpu(vcpu);
+	struct shadow_vcpu_state *shadow_vcpu = pkvm_hvcpu->current_shadow_vcpu;
+
+	u32 pin_based_exec_control = vmcs_read32(PIN_BASED_VM_EXEC_CONTROL);
+	u32 cpu_based_exec_control = vmcs_read32(CPU_BASED_VM_EXEC_CONTROL);
+	u32 vm_entry_controls = vmcs_read32(VM_ENTRY_CONTROLS);
+	u32 vm_exit_controls = vmcs_read32(VM_EXIT_CONTROLS);
+	u32 secondary_exec_control;
+
+	if (!nested_check_enforced_bits(pin_based_exec_control,
+					NESTED_PIN_BASED_SET,
+					NESTED_PIN_BASED_CLR) ||
+	    !nested_check_enforced_bits(cpu_based_exec_control,
+					NESTED_CPU_BASED_SET,
+					NESTED_CPU_BASED_CLR) ||
+	    !nested_check_enforced_bits(vm_entry_controls,
+					NESTED_VM_ENTRY_SET,
+					NESTED_VM_ENTRY_CLR) ||
+	    !nested_check_enforced_bits(vm_exit_controls,
+					NESTED_VM_EXIT_SET,
+					NESTED_VM_EXIT_CLR)) {
+		return false;
+	}
+
+	secondary_exec_control = vmcs_read32(SECONDARY_VM_EXEC_CONTROL);
+	if (!nested_check_enforced_bits(secondary_exec_control,
+					NESTED_SECONDARY_EXEC_SET,
+					NESTED_SECONDARY_EXEC_CLR) ||
+	    vmcs_read64(EPT_POINTER) != shadow_vcpu->vm->sept_desc.shadow_eptp) {
+		return false;
+	}
+
+	return true;
+}
+
 static void nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
@@ -741,6 +811,10 @@ static void nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
 		nested_vmx_result(VMfailValid,
 			launch ? VMXERR_VMLAUNCH_NONCLEAR_VMCS : VMXERR_VMRESUME_NONLAUNCHED_VMCS);
 	} else if (!READ_ONCE(cur_shadow_vcpu->allowed_to_run)) {
+		nested_vmx_result(VMfailInvalid, 0);
+	} else if (IS_ENABLED(CONFIG_PKVM_INTEL_FORCE_PROTECTED_VM) &&
+		   !shadow_vcpu_is_protected(cur_shadow_vcpu)) {
+		pkvm_err("pkvm: configuration disallows unprotected VMs\n");
 		nested_vmx_result(VMfailInvalid, 0);
 	} else {
 		/*
@@ -765,6 +839,18 @@ static void nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
 		if (!initp) {
 			pkvm_info("pkvm launcing a protected VM\n%s\n", debug_dump_vmcs());
 			initp = 1;
+		}
+
+		/* make sure guest VMCS uphold the isolation guarantees */
+		if (!nested_check_vmcs(vcpu)) {
+			pkvm_err("pkvm: insecure guest vmcs\n");
+
+			vmcs_clear_track(vmx, vmcs02);
+			set_shadow_indicator(vmcs02);
+			vmcs_load_track(vmx, vmcs02);
+
+			nested_vmx_result(VMfailInvalid, 0);
+			return;
 		}
 
 		/* mark guest mode */
