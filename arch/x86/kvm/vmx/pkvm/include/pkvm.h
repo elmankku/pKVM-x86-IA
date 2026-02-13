@@ -61,6 +61,7 @@ struct pkvm_host_vm {
 struct pkvm_iommu_info {
 	u64 reg_phys;
 	u64 reg_size;
+	bool scalable_mode;
 };
 
 struct pkvm_hyp {

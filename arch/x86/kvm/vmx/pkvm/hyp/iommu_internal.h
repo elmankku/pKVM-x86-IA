@@ -38,6 +38,8 @@ struct pkvm_iommu {
 	pkvm_spinlock_t qi_lock;
 	u64 piommu_iqa;
 
+	bool scalable_mode;
+
 	/* Link ptdev information of this IOMMU */
 	struct list_head ptdev_head;
 };
