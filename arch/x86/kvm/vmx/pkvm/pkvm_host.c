@@ -181,17 +181,6 @@ static __init int check_and_init_iommu(struct pkvm_hyp *pkvm)
 			return -EINVAL;
 		}
 
-		/*
-		 * pkvm requires host IOMMU driver to work in scalable mode with
-		 * first-level translation or legacy mode.
-		 */
-		if ((readl(drhd->iommu->reg + DMAR_GSTS_REG) & DMA_GSTS_TES) &&
-			(readq(drhd->iommu->reg + DMAR_RTADDR_REG) & BIT(11))) {
-			pr_err("pkvm: drhd reg_base 0x%llx: scalable/legacy mode not enabled\n",
-				drhd->reg_base_addr);
-			return -EINVAL;
-		}
-
 		addr = ioremap(drhd->reg_base_addr, VTD_PAGE_SIZE);
 		if (!addr) {
 			pr_err("pkvm: failed to map drhd reg physical addr 0x%llx\n",
@@ -199,10 +188,26 @@ static __init int check_and_init_iommu(struct pkvm_hyp *pkvm)
 			return -EINVAL;
 		}
 
+		u64 rtaddr = readq(addr + DMAR_RTADDR_REG);
+
+		/*
+		 * pkvm requires host IOMMU driver to work in scalable mode with
+		 * first-level translation or legacy mode.
+		 */
+		if ((readl(addr + DMAR_GSTS_REG) & DMA_GSTS_TES) &&
+		    (rtaddr & BIT(11))) {
+			iounmap(addr);
+			pr_err("pkvm: drhd reg_base 0x%llx: scalable/legacy mode not enabled\n",
+				drhd->reg_base_addr);
+			return -EINVAL;
+		}
+
 		info = &pkvm->iommu_infos[index];
 		cap = readq(addr + DMAR_CAP_REG);
 		ecap = readq(addr + DMAR_ECAP_REG);
-		bool sm_active = !!(readq(addr + DMAR_RTADDR_REG) & DMA_RTADDR_SMT);
+
+		bool sm_active = !!(rtaddr & DMA_RTADDR_SMT);
+
 		iounmap(addr);
 
 		/*
