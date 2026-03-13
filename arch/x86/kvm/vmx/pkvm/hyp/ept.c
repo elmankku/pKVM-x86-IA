@@ -445,14 +445,14 @@ int handle_host_ept_violation(struct kvm_vcpu *vcpu, bool *skip_instruction)
 
 	*skip_instruction = true;
 
-	if (is_memory || pkvm_host_init_complete) {
-		pkvm_err("%s: not handle for memory address 0x%lx\n", __func__, gpa);
-		return -EPERM;
-	}
-
 	ret = try_emul_host_mmio(vcpu, gpa);
 	if (ret != -EINVAL) {
 		return ret;
+	}
+
+	if (is_memory) {
+		pkvm_err("%s: not handle for memory address 0x%lx\n", __func__, gpa);
+		return -EPERM;
 	}
 
 	pkvm_spin_lock(&_host_ept_lock);
