@@ -7,6 +7,11 @@
 #include "pkvm_hyp.h"
 #include "pgtable.h"
 
+struct iommu_pgt {
+	bool initialized;
+	struct pkvm_pgtable pgt;
+};
+
 struct pkvm_ptdev {
 	atomic_t refcount;
 	struct hlist_node hnode;
@@ -23,6 +28,8 @@ struct pkvm_ptdev {
 	struct pkvm_pgtable vpgt;
 	/* Represents the page table maintained by pKVM */
 	struct pkvm_pgtable *pgt;
+
+	struct iommu_pgt iommu_pgt;
 
 	pkvm_spinlock_t lock;
 

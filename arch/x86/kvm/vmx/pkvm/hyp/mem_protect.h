@@ -50,7 +50,6 @@ static inline enum pkvm_page_state pkvm_getstate(u64 pte)
 typedef u32 pkvm_id;
 
 #define OWNER_ID_HYP	0UL
-#define OWNER_ID_HOST	1UL
 #define OWNER_ID_INV	(~(u32)0UL)
 
 /*

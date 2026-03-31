@@ -12,5 +12,6 @@ int pkvm_activate_iommu(void);
 int pkvm_iommu_sync(u16 bdf, u32 pasid);
 bool pkvm_iommu_coherency(u16 bdf, u32 pasid);
 void pkvm_iommu_flush_iotlb(struct pkvm_pgtable *pgt, unsigned long addr, unsigned long size);
+int pkvm_iommu_unmap_by_hpa(struct pkvm_shadow_vm *vm, unsigned long hpa, unsigned long size);
 
 #endif

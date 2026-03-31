@@ -6,6 +6,7 @@
 #define __PKVM_EPT_H
 
 #include "pkvm_hyp.h"
+#include "mem_protect.h"
 
 #define HOST_EPT_DEF_MEM_PROT   (VMX_EPT_RWX_MASK |				\
 				(MTRR_TYPE_WRBACK << VMX_EPT_MT_EPTE_SHIFT))
@@ -66,5 +67,7 @@ static inline bool is_valid_eptp(u64 eptp)
 }
 
 extern struct pkvm_pgtable_ops ept_ops;
+
+pkvm_id pkvm_host_ept_owner_id(unsigned long hpa, pkvm_id *owner);
 
 #endif

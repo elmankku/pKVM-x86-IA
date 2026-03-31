@@ -3,6 +3,7 @@
  * Copyright (C) 2022 Intel Corporation
  */
 
+#include "linux/align.h"
 #include <linux/types.h>
 #include <linux/memblock.h>
 #include <asm/kvm_pkvm.h>
@@ -259,6 +260,74 @@ void pkvm_host_ept_lookup(unsigned long vaddr, unsigned long *pphys,
 	pkvm_pgtable_lookup(&host_ept, vaddr, pphys, pprot, plevel);
 }
 
+struct host_ept_lookup_raw_data {
+	unsigned long vaddr;
+	unsigned long phys;
+	u64 pte;
+	int level;
+};
+
+/* Raw host-EPT lookup that preserves leaf owner annotation bits. */
+static int host_ept_lookup_raw_cb(struct pkvm_pgtable *pgt,
+				  unsigned long aligned_vaddr,
+				  unsigned long aligned_vaddr_end,
+				  int level, void *ptep,
+				  unsigned long flags,
+				  struct pgt_flush_data *flush_data,
+				  void *const arg)
+{
+	struct host_ept_lookup_raw_data *data = arg;
+	struct pkvm_pgtable_ops *pgt_ops = pgt->pgt_ops;
+	u64 pte = READ_ONCE(*(u64 *)ptep);
+
+	data->phys = INVALID_ADDR;
+	data->pte = 0;
+	data->level = level;
+
+	if (unlikely(!pgt_ops->pgt_entry_is_leaf(&pte, level)))
+		return -EAGAIN;
+
+	if (pgt_ops->pgt_entry_present(&pte)) {
+		unsigned long offset =
+			data->vaddr & ~pgt_ops->pgt_level_page_mask(level);
+
+		data->phys = pgt_ops->pgt_entry_to_phys(&pte) + offset;
+	}
+
+	data->pte = pte;
+	return PGTABLE_WALK_DONE;
+}
+
+static void pkvm_host_ept_lookup_raw(unsigned long vaddr,
+				     unsigned long *pphys,
+				     u64 *ppte,
+				     int *plevel)
+{
+	struct host_ept_lookup_raw_data data = {
+		.vaddr = vaddr,
+		.phys = INVALID_ADDR,
+		.pte = 0,
+		.level = 0,
+	};
+	struct pkvm_pgtable_walker walker = {
+		.cb = host_ept_lookup_raw_cb,
+		.arg = &data,
+		.flags = PKVM_PGTABLE_WALK_LEAF,
+	};
+	int ret, retry_cnt = 0;
+
+	do {
+		ret = pgtable_walk(&host_ept, vaddr, PAGE_SIZE, true, &walker);
+	} while (ret == -EAGAIN && retry_cnt++ < 5);
+
+	if (pphys)
+		*pphys = data.phys;
+	if (ppte)
+		*ppte = data.pte;
+	if (plevel)
+		*plevel = data.level;
+}
+
 void host_ept_lock(void)
 {
 	pkvm_spin_lock(&_host_ept_lock);
@@ -358,7 +427,7 @@ static bool is_pvmfw_memory(unsigned long pa)
 }
 
 static void __maybe_unused hexdump(const unsigned char *token,
-                                   const unsigned char *buf, unsigned short len)
+				   const unsigned char *buf, unsigned short len)
 {
 	printk(KERN_CONT "%s", token);
 	for (int i=0; i < len; i++) {
@@ -756,6 +825,13 @@ static int pkvm_pgstate_pgt_free_leaf(struct pkvm_pgtable *pgt, unsigned long va
 		 */
 		if (find_mem_range(phys, &range))
 			memset(pgt->mm_ops->phys_to_virt(phys), 0, min(size, range.end - phys));
+
+		ret = pkvm_iommu_unmap_by_hpa(vm, phys, size);
+		if (ret) {
+			pkvm_err("%s: iommu unmap failed for phys=0x%lx size=0x%lx", __func__, phys, size);
+			return ret;
+		}
+
 		pgt->mm_ops->get_page(ptep);
 		ret = __pkvm_host_undonate_guest(phys, pgt, vaddr, size);
 		pgt->mm_ops->put_page(ptep);
@@ -766,6 +842,22 @@ static int pkvm_pgstate_pgt_free_leaf(struct pkvm_pgtable *pgt, unsigned long va
 		pkvm_err("%s failed: ret %d vm_type %d phys 0x%lx GPA 0x%lx size 0x%lx\n",
 			 __func__, ret, vm->vm_type, phys, vaddr, size);
 	return ret;
+}
+
+pkvm_id pkvm_host_ept_owner_id(unsigned long hpa, pkvm_id *owner)
+{
+	unsigned long phys;
+	u64 pte;
+
+	pkvm_host_ept_lookup_raw(hpa, &phys, &pte, NULL);
+	if (pkvm_getstate(pte) != PKVM_NOPAGE) {
+		/* owner id is invalid */
+		return -ENOENT;
+	}
+
+	*owner = FIELD_GET(PKVM_INVALID_PTE_OWNER_MASK, pte);
+
+	return 0;
 }
 
 static void __invalidate_shadow_ept_with_range(struct shadow_ept_desc *desc,

@@ -10,6 +10,7 @@
 #include "iommu_spgt.h"
 #include "bug.h"
 #include "pci.h"
+#include "ept.h"
 
 #define MAX_PTDEV_NUM	(PKVM_MAX_PDEV_NUM + PKVM_MAX_PASID_PDEV_NUM)
 static DEFINE_HASHTABLE(ptdev_hasht, 8);
@@ -45,6 +46,56 @@ struct pkvm_ptdev *pkvm_alloc_ptdev(u16 bdf, u32 pasid, bool coherency)
 	return ptdev;
 }
 
+static bool pkvm_ptdev_pgt_is_host_iommu_spgt(struct pkvm_ptdev *ptdev)
+{
+	return ptdev->pgt != pkvm_hyp->host_vm.ept &&
+		ptdev->pgt != &ptdev->iommu_pgt.pgt;
+}
+
+static int pkvm_init_iommu_pgt(struct pkvm_ptdev *ptdev)
+{
+	struct pkvm_pgtable_cap cap = {
+		.level = pkvm_hyp->ept_iommu_pgt_level,
+		.allowed_pgsz = pkvm_hyp->ept_iommu_pgsz_mask,
+		.table_prot = VMX_EPT_RWX_MASK,
+	};
+	int ret;
+
+	if (!ptdev) {
+		return -EINVAL;
+	}
+
+	if (ptdev->iommu_pgt.initialized) {
+		return 0;
+	}
+
+	ret = pkvm_pgtable_init(&ptdev->iommu_pgt.pgt,
+				pkvm_shadow_sl_iommu_pgt_get_mm_ops(ptdev->iommu_coherency),
+				&ept_ops, &cap, true);
+	if (ret)
+		return ret;
+
+	ptdev->iommu_pgt.initialized = true;
+	return 0;
+}
+
+static int pkvm_deinit_iommu_pgt(struct pkvm_ptdev *ptdev)
+{
+	if (!ptdev) {
+		return -EINVAL;
+	}
+
+	if (!ptdev->iommu_pgt.initialized) {
+		return 0;
+	}
+
+	pkvm_pgtable_destroy(&ptdev->iommu_pgt.pgt, NULL);
+	memset(&ptdev->iommu_pgt.pgt, 0, sizeof(ptdev->iommu_pgt.pgt));
+	ptdev->iommu_pgt.initialized = false;
+
+	return 0;
+}
+
 struct pkvm_ptdev *pkvm_get_ptdev(u16 bdf, u32 pasid)
 {
 	struct pkvm_ptdev *ptdev = NULL, *tmp;
@@ -74,8 +125,10 @@ void pkvm_put_ptdev(struct pkvm_ptdev *ptdev)
 
 	__clear_bit(ptdev->index, ptdevs_bitmap);
 
-	if (ptdev->pgt != pkvm_hyp->host_vm.ept)
+	if (pkvm_ptdev_pgt_is_host_iommu_spgt(ptdev))
 		pkvm_put_host_iommu_spgt(ptdev->pgt, ptdev->iommu_coherency);
+
+	pkvm_deinit_iommu_pgt(ptdev);
 
 	memset(ptdev, 0, sizeof(struct pkvm_ptdev));
 
@@ -88,7 +141,7 @@ void pkvm_setup_ptdev_vpgt(struct pkvm_ptdev *ptdev, unsigned long root_gpa,
 {
 	pkvm_spin_lock(&ptdev->lock);
 
-	if (ptdev->pgt != pkvm_hyp->host_vm.ept &&
+	if (pkvm_ptdev_pgt_is_host_iommu_spgt(ptdev) &&
 			(!shadowed || root_gpa != ptdev->vpgt.root_pa) &&
 			!ptdev_attached_to_vm(ptdev)) {
 		pkvm_put_host_iommu_spgt(ptdev->pgt, ptdev->iommu_coherency);
@@ -146,6 +199,12 @@ void pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_shadow_vm *vm)
 				    ptdev->iommu_coherency);
 	pkvm_iommu_sync(ptdev->bdf, ptdev->pasid);
 
+	/* Reclaim the dedicated DMA root only after the detach sync path
+	 * has switched the ptdev back to the host root and flushed it. */
+	pkvm_spin_lock(&ptdev->lock);
+	pkvm_deinit_iommu_pgt(ptdev);
+	pkvm_spin_unlock(&ptdev->lock);
+
 	pkvm_put_ptdev(ptdev);
 }
 
@@ -170,6 +229,7 @@ void pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_shadow_vm *vm)
 int pkvm_attach_ptdev(u16 bdf, u32 pasid, struct pkvm_shadow_vm *vm)
 {
 	struct pkvm_ptdev *ptdev = pkvm_get_ptdev(bdf, pasid);
+	int ret;
 
 	if (!ptdev) {
 		ptdev = pkvm_alloc_ptdev(bdf, pasid,
@@ -191,14 +251,21 @@ int pkvm_attach_ptdev(u16 bdf, u32 pasid, struct pkvm_shadow_vm *vm)
 	pkvm_ptdev_cache_bar(ptdev);
 
 	PKVM_ASSERT(ptdev->pgt != &vm->pgstate_pgt);
-	if (ptdev->pgt != pkvm_hyp->host_vm.ept)
+	if (pkvm_ptdev_pgt_is_host_iommu_spgt(ptdev))
 		pkvm_put_host_iommu_spgt(ptdev->pgt, ptdev->iommu_coherency);
 
-	/*
-	 * Reset pgt of this ptdev to VM's pgstate_pgt so need to update
-	 * IOMMU page table accordingly.
-	 */
-	ptdev->pgt = &vm->pgstate_pgt;
+	/* Attached protected devices use a dedicated pKVM-owned DMA root */
+	ret = pkvm_init_iommu_pgt(ptdev);
+	if (ret) {
+		ptdev->shadow_vm_handle = 0;
+		ptdev->pgt = pkvm_hyp->host_vm.ept;
+		pkvm_spin_unlock(&ptdev->lock);
+		pkvm_put_ptdev(ptdev);
+
+		return ret;
+	}
+
+	ptdev->pgt = &ptdev->iommu_pgt.pgt;
 
 	pkvm_spin_unlock(&ptdev->lock);
 

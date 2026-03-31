@@ -6,6 +6,7 @@
 #include "pkvm_hyp.h"
 #include "mem_protect.h"
 #include "coredump.h"
+#include "iommu.h"
 
 static int pkvm_coredump_pgt_free_leaf(struct pkvm_pgtable *pgt,
 				      unsigned long vaddr,
@@ -24,6 +25,12 @@ static int pkvm_coredump_pgt_free_leaf(struct pkvm_pgtable *pgt,
 
 	switch(vm->vm_type) {
 	case KVM_X86_PKVM_PROTECTED_VM: {
+		ret = pkvm_iommu_unmap_by_hpa(vm, phys, size);
+		if (ret) {
+			pkvm_err("%s: iommu unmap failed for phys=0x%lx size=0x%lx", __func__, phys, size);
+			break;
+		}
+
 		pgt->mm_ops->get_page(ptep);
 		ret = __pkvm_host_undonate_guest(phys, pgt, vaddr, size);
 		pgt->mm_ops->put_page(ptep);
@@ -46,18 +53,18 @@ static int pkvm_coredump_pgt_free_leaf(struct pkvm_pgtable *pgt,
 
 int pkvm_prepare_vm_coredump(struct mm_struct *mm)
 {
-       struct pkvm_shadow_vm *vm;
+	struct pkvm_shadow_vm *vm;
 
-       vm = get_shadow_vm_by_mm(mm);
-       if (!vm)
-               return -ENOENT;
+	vm = get_shadow_vm_by_mm(mm);
+	if (!vm)
+		return -ENOENT;
 
-       pkvm_spin_lock(&vm->lock);
-       pkvm_pgtable_destroy(&vm->pgstate_pgt, pkvm_coredump_pgt_free_leaf);
-       pkvm_spin_unlock(&vm->lock);
+	pkvm_spin_lock(&vm->lock);
+	pkvm_pgtable_destroy(&vm->pgstate_pgt, pkvm_coredump_pgt_free_leaf);
+	pkvm_spin_unlock(&vm->lock);
 
-       put_shadow_vm(vm->shadow_vm_handle);
+	put_shadow_vm(vm->shadow_vm_handle);
 
-       return 0;
+	return 0;
 }
 

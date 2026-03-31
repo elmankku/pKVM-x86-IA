@@ -233,7 +233,6 @@ unsigned long __pkvm_teardown_shadow_vm(int shadow_vm_handle)
 #endif
 
 	pkvm_shadow_ept_deinit(&vm->sept_desc);
-
 	pkvm_pgstate_pgt_deinit(vm);
 
 	list_for_each_entry_safe(ptdev, tmp, &vm->ptdev_head, vm_node)
