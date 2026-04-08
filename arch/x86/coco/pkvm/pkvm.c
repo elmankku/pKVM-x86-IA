@@ -5,6 +5,9 @@
 
 #include <linux/cpufeature.h>
 #include <linux/kvm_para.h>
+#include <linux/mm.h>
+#include <linux/memremap.h>
+#include <linux/dma-map-ops.h>
 #include <asm/coco.h>
 #include <asm/vmx.h>
 #include <asm/pkvm.h>
@@ -98,6 +101,35 @@ static bool pkvm_handle_virt_exception(struct pt_regs *regs, struct ve_info *ve)
 	regs->ip += insn_len;
 
 	return true;
+}
+
+static int prefault_page(unsigned long addr, int numpages)
+{
+	unsigned long cur = addr & PAGE_MASK;
+	int i;
+
+	for (i = 0; i < numpages; i++, cur += PAGE_SIZE)
+		READ_ONCE(*(u8 *)cur);
+
+	return 0;
+}
+
+void arch_dma_prep_map(struct page *page, size_t offset, size_t size)
+{
+	void *vaddr;
+	unsigned long addr;
+	int npages;
+
+	if (!pkvm_is_protected_guest() || is_pci_p2pdma_page(page))
+		return;
+
+	vaddr = page_address(page);
+	if (WARN_ON_ONCE(!vaddr))
+		return;
+
+	addr = (unsigned long)vaddr + offset;
+	npages = DIV_ROUND_UP(offset_in_page(addr) + size, PAGE_SIZE);
+	prefault_page(addr & PAGE_MASK, npages);
 }
 
 __init void pkvm_guest_init_coco(void)

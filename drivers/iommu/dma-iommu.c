@@ -1211,6 +1211,8 @@ dma_addr_t iommu_dma_map_page(struct device *dev, struct page *page,
 		}
 	}
 
+	arch_dma_prep_map(page, offset, size);
+
 	if (!coherent && !(attrs & DMA_ATTR_SKIP_CPU_SYNC))
 		arch_sync_dma_for_device(phys, size, dir);
 
@@ -1397,6 +1399,9 @@ int iommu_dma_map_sg(struct device *dev, struct scatterlist *sg, int nents,
 
 	if (dev_use_sg_swiotlb(dev, sg, nents, dir))
 		return iommu_dma_map_sg_swiotlb(dev, sg, nents, dir, attrs);
+
+	for_each_sg(sg, s, nents, i)
+		arch_dma_prep_map(sg_page(s), s->offset, s->length);
 
 	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
 		iommu_dma_sync_sg_for_device(dev, sg, nents, dir);

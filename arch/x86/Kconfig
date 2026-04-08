@@ -912,6 +912,7 @@ config PKVM_GUEST
 	depends on X86_64 && !PKVM_INTEL
 	select ARCH_HAS_CC_PLATFORM
 	select X86_MEM_ENCRYPT
+	select ARCH_HAS_DMA_PREP_MAP
 	default n
 	help
 	  Support running as a protected guest under Protected KVM.

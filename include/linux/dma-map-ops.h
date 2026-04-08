@@ -491,4 +491,12 @@ pci_p2pdma_map_segment(struct pci_p2pdma_map_state *state, struct device *dev,
 }
 #endif /* CONFIG_PCI_P2PDMA */
 
+#ifdef CONFIG_ARCH_HAS_DMA_PREP_MAP
+void arch_dma_prep_map(struct page *page, size_t offset, size_t size);
+#else
+static inline void arch_dma_prep_map(struct page *page, size_t offset, size_t size)
+{
+}
+#endif
+
 #endif /* _LINUX_DMA_MAP_OPS_H */
