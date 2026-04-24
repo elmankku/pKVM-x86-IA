@@ -81,7 +81,9 @@ static bool host_vpci_cfg_data_allow_write(struct pkvm_ptdev *ptdev, u64 offset,
 {
 	int index;
 
-	if (!ptdev_attached_to_vm(ptdev))
+	// HACK: temporarily disable BAR writes until the case with
+	// addresses that are imcompatible for the guest is fixed.
+	// if (!ptdev_attached_to_vm(ptdev))
 		return true;
 
 	if (offset >= 0x10 && offset < 0x28) {
