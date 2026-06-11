@@ -2983,6 +2983,19 @@ static const struct bdb_header *get_bdb_header(const struct vbt_header *vbt)
 	return _vbt + vbt->bdb_offset;
 }
 
+static int check_vbt_signature(const struct vbt_header *vbt)
+{
+#if IS_ENABLED(CONFIG_PKVM_GUEST)
+	char signature[4] = { 0 };
+
+	memcpy_fromio(signature, vbt->signature, 4);
+
+	return memcmp(signature, "$VBT", 4);
+#else
+	return memcmp(vbt->signature, "$VBT", 4);
+#endif
+}
+
 /**
  * intel_bios_is_valid_vbt - does the given buffer contain a valid VBT
  * @display:	display device
@@ -3005,7 +3018,7 @@ bool intel_bios_is_valid_vbt(struct intel_display *display,
 		return false;
 	}
 
-	if (memcmp(vbt->signature, "$VBT", 4)) {
+	if (check_vbt_signature(vbt)) {
 		drm_dbg_kms(display->drm, "VBT invalid signature\n");
 		return false;
 	}

@@ -1141,6 +1141,27 @@ bool intel_opregion_vbt_present(struct intel_display *display)
 	return true;
 }
 
+static const void *intel_opregion_vbt_dup(const void *src, size_t len, gfp_t gfp)
+{
+#if IS_ENABLED(CONFIG_PKVM_GUEST)
+	/* A quirk to handle situations where VMM models the region as MMIO.
+	 * kmemdup generates instructions that are not supported by the #VE
+	 * exception handler.
+	 */
+	void *dst;
+
+	dst = kmalloc(len, gfp);
+	if (!dst)
+		return NULL;
+
+	memcpy_fromio(dst, src, len);
+
+	return dst;
+#else
+	return kmemdup(src, len, GFP_KERNEL);
+#endif
+}
+
 const void *intel_opregion_get_vbt(struct intel_display *display, size_t *size)
 {
 	struct intel_opregion *opregion = display->opregion;
@@ -1151,7 +1172,7 @@ const void *intel_opregion_get_vbt(struct intel_display *display, size_t *size)
 	if (size)
 		*size = opregion->vbt_size;
 
-	return kmemdup(opregion->vbt, opregion->vbt_size, GFP_KERNEL);
+	return intel_opregion_vbt_dup(opregion->vbt, opregion->vbt_size, GFP_KERNEL);
 }
 
 bool intel_opregion_headless_sku(struct intel_display *display)
