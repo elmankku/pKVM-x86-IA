@@ -40,6 +40,9 @@ static inline bool hypervisor_isolated_pci_functions(void)
 	if (IS_ENABLED(CONFIG_LOONGARCH))
 		return true;
 
+	if (IS_ENABLED(CONFIG_PCI_PROBE_ISOLATED_FUNCTIONS))
+		return true;
+
 	return jailhouse_paravirt();
 }
 

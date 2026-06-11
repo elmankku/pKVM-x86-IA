@@ -77,6 +77,14 @@ config PCI_DEBUG
 
 	  When in doubt, say N.
 
+config PCI_PROBE_ISOLATED_FUNCTIONS
+	bool "Probe isolated PCI functions without function 0"
+	help
+	  Allow PCI enumeration to continue probing a slot even if function 0
+	  is absent. This is useful in some virtualized environments where the
+	  hypervisor exposes only a passed-through PCI function without creating
+	  dummy functions for the rest of the slot.
+
 config PCI_REALLOC_ENABLE_AUTO
 	bool "Enable PCI resource re-allocation detection"
 	depends on PCI_IOV
