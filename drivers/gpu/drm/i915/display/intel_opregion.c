@@ -29,6 +29,13 @@
 #include <linux/debugfs.h>
 #include <linux/dmi.h>
 #include <linux/iopoll.h>
+#include <linux/io-64-nonatomic-lo-hi.h>
+#include <linux/unaligned.h>
+
+#ifdef CONFIG_PKVM_X86_GUEST
+#include <asm/pkvm_guest.h>
+#endif
+
 #include <acpi/video.h>
 
 #include <drm/drm_edid.h>
@@ -272,6 +279,94 @@ struct intel_opregion {
 	struct notifier_block acpi_notifier;
 };
 
+/*
+ * Protected guests access host-provided OpRegion firmware through MMIO
+ * hypercalls. Keep ordinary memory accesses for other guests and bare metal.
+ */
+static bool opregion_use_mmio(void)
+{
+#ifdef CONFIG_PKVM_X86_GUEST
+	return pkvm_is_protected_guest();
+#else
+	return false;
+#endif
+}
+
+static u8 opregion_read8(const void *addr)
+{
+	if (opregion_use_mmio())
+		return readb((const void __force __iomem *)addr);
+
+	return get_unaligned((const u8 *)addr);
+}
+
+static u32 opregion_read32(const void *addr)
+{
+	if (opregion_use_mmio())
+		return readl((const void __force __iomem *)addr);
+
+	return get_unaligned((const u32 *)addr);
+}
+
+static u64 opregion_read64(const void *addr)
+{
+	if (opregion_use_mmio())
+		return readq((const void __force __iomem *)addr);
+
+	return get_unaligned((const u64 *)addr);
+}
+
+static void opregion_write32(void *addr, u32 value)
+{
+	if (opregion_use_mmio())
+		writel(value, (void __force __iomem *)addr);
+	else
+		put_unaligned(value, (u32 *)addr);
+}
+
+static void opregion_memcpy(void *dst, const void *src, size_t size)
+{
+	if (opregion_use_mmio())
+		memcpy_fromio(dst, (const void __force __iomem *)src, size);
+	else
+		memcpy(dst, src, size);
+}
+
+static void *opregion_memdup(const void *src, size_t size)
+{
+	void *dst = kmalloc(size, GFP_KERNEL);
+
+	if (dst)
+		opregion_memcpy(dst, src, size);
+
+	return dst;
+}
+
+/* The validator and subsequent VBT parsing only operate on guest RAM. */
+static int opregion_set_vbt(struct intel_display *display,
+			    const void *src, size_t size)
+{
+	struct intel_opregion *opregion = display->opregion;
+	void *vbt;
+
+	if (!src)
+		return -EINVAL;
+
+	vbt = opregion_memdup(src, size);
+	if (!vbt)
+		return -ENOMEM;
+
+	if (!intel_bios_is_valid_vbt(display, vbt, size)) {
+		kfree(vbt);
+		return -EINVAL;
+	}
+
+	opregion->vbt = vbt;
+	opregion->vbt_size = size;
+
+	return 0;
+}
+
 static int check_swsci_function(struct intel_display *display, u32 function)
 {
 	struct intel_opregion *opregion = display->opregion;
@@ -320,7 +415,7 @@ static int swsci(struct intel_display *display,
 	swsci = display->opregion->swsci;
 
 	/* Driver sleep timeout in ms. */
-	dslp = swsci->dslp;
+	dslp = opregion_read32(&swsci->dslp);
 	if (!dslp) {
 		/* The spec says 2ms should be the default, but it's too small
 		 * for some machines. */
@@ -333,7 +428,7 @@ static int swsci(struct intel_display *display,
 	}
 
 	/* The spec tells us to do this, but we are the only user... */
-	scic = swsci->scic;
+	scic = opregion_read32(&swsci->scic);
 	if (scic & SWSCI_SCIC_INDICATOR) {
 		drm_dbg(display->drm, "SWSCI request already in progress\n");
 		return -EBUSY;
@@ -341,8 +436,8 @@ static int swsci(struct intel_display *display,
 
 	scic = function | SWSCI_SCIC_INDICATOR;
 
-	swsci->parm = parm;
-	swsci->scic = scic;
+	opregion_write32(&swsci->parm, parm);
+	opregion_write32(&swsci->scic, scic);
 
 	/* Ensure SCI event is selected and event trigger is cleared. */
 	pci_read_config_word(pdev, SWSCI, &swsci_val);
@@ -357,7 +452,7 @@ static int swsci(struct intel_display *display,
 	pci_write_config_word(pdev, SWSCI, swsci_val);
 
 	/* Poll for the result. */
-	ret = poll_timeout_us(scic = swsci->scic,
+	ret = poll_timeout_us(scic = opregion_read32(&swsci->scic),
 			      (scic & SWSCI_SCIC_INDICATOR) == 0,
 			      1000, dslp * 1000, false);
 	if (ret) {
@@ -375,7 +470,7 @@ static int swsci(struct intel_display *display,
 	}
 
 	if (parm_out)
-		*parm_out = swsci->parm;
+		*parm_out = opregion_read32(&swsci->parm);
 
 	return 0;
 
@@ -522,7 +617,7 @@ static u32 asle_set_backlight(struct intel_display *display, u32 bclp)
 	for_each_intel_connector_iter(connector, &conn_iter)
 		intel_backlight_set_acpi(connector->base.state, bclp, 255);
 	drm_connector_list_iter_end(&conn_iter);
-	asle->cblv = DIV_ROUND_UP(bclp * 100, 255) | ASLE_CBLV_VALID;
+	opregion_write32(&asle->cblv, DIV_ROUND_UP(bclp * 100, 255) | ASLE_CBLV_VALID);
 
 	drm_modeset_unlock(&display->drm->mode_config.connection_mutex);
 
@@ -623,7 +718,7 @@ static void asle_work(struct work_struct *work)
 	if (!asle)
 		return;
 
-	aslc_req = asle->aslc;
+	aslc_req = opregion_read32(&asle->aslc);
 
 	if (!(aslc_req & ASLC_REQ_MSK)) {
 		drm_dbg(display->drm,
@@ -632,34 +727,34 @@ static void asle_work(struct work_struct *work)
 	}
 
 	if (aslc_req & ASLC_SET_ALS_ILLUM)
-		aslc_stat |= asle_set_als_illum(display, asle->alsi);
+		aslc_stat |= asle_set_als_illum(display, opregion_read32(&asle->alsi));
 
 	if (aslc_req & ASLC_SET_BACKLIGHT)
-		aslc_stat |= asle_set_backlight(display, asle->bclp);
+		aslc_stat |= asle_set_backlight(display, opregion_read32(&asle->bclp));
 
 	if (aslc_req & ASLC_SET_PFIT)
-		aslc_stat |= asle_set_pfit(display, asle->pfit);
+		aslc_stat |= asle_set_pfit(display, opregion_read32(&asle->pfit));
 
 	if (aslc_req & ASLC_SET_PWM_FREQ)
-		aslc_stat |= asle_set_pwm_freq(display, asle->pfmb);
+		aslc_stat |= asle_set_pwm_freq(display, opregion_read32(&asle->pfmb));
 
 	if (aslc_req & ASLC_SUPPORTED_ROTATION_ANGLES)
 		aslc_stat |= asle_set_supported_rotation_angles(display,
-							asle->srot);
+							opregion_read32(&asle->srot));
 
 	if (aslc_req & ASLC_BUTTON_ARRAY)
-		aslc_stat |= asle_set_button_array(display, asle->iuer);
+		aslc_stat |= asle_set_button_array(display, opregion_read32(&asle->iuer));
 
 	if (aslc_req & ASLC_CONVERTIBLE_INDICATOR)
-		aslc_stat |= asle_set_convertible(display, asle->iuer);
+		aslc_stat |= asle_set_convertible(display, opregion_read32(&asle->iuer));
 
 	if (aslc_req & ASLC_DOCKING_INDICATOR)
-		aslc_stat |= asle_set_docking(display, asle->iuer);
+		aslc_stat |= asle_set_docking(display, opregion_read32(&asle->iuer));
 
 	if (aslc_req & ASLC_ISCT_STATE_CHANGE)
 		aslc_stat |= asle_isct_state(display);
 
-	asle->aslc = aslc_stat;
+	opregion_write32(&asle->aslc, aslc_stat);
 }
 
 bool intel_opregion_asle_present(struct intel_display *display)
@@ -698,10 +793,10 @@ static int intel_opregion_video_event(struct notifier_block *nb,
 
 	acpi = opregion->acpi;
 
-	if (event->type == 0x80 && ((acpi->cevt & 1) == 0))
+	if (event->type == 0x80 && ((opregion_read32(&acpi->cevt) & 1) == 0))
 		ret = NOTIFY_BAD;
 
-	acpi->csts = 0;
+	opregion_write32(&acpi->csts, 0);
 
 	return ret;
 }
@@ -715,14 +810,14 @@ static int intel_opregion_video_event(struct notifier_block *nb,
 static void set_did(struct intel_opregion *opregion, int i, u32 val)
 {
 	if (i < ARRAY_SIZE(opregion->acpi->didl)) {
-		opregion->acpi->didl[i] = val;
+		opregion_write32(&opregion->acpi->didl[i], val);
 	} else {
 		i -= ARRAY_SIZE(opregion->acpi->didl);
 
 		if (WARN_ON(i >= ARRAY_SIZE(opregion->acpi->did2)))
 			return;
 
-		opregion->acpi->did2[i] = val;
+		opregion_write32(&opregion->acpi->did2[i], val);
 	}
 }
 
@@ -786,13 +881,13 @@ static void intel_setup_cadls(struct intel_display *display)
 	for_each_intel_connector_iter(connector, &conn_iter) {
 		if (i >= ARRAY_SIZE(opregion->acpi->cadl))
 			break;
-		opregion->acpi->cadl[i++] = connector->acpi_device_id;
+		opregion_write32(&opregion->acpi->cadl[i++], connector->acpi_device_id);
 	}
 	drm_connector_list_iter_end(&conn_iter);
 
 	/* If fewer than 8 active devices, the list must be null terminated */
 	if (i < ARRAY_SIZE(opregion->acpi->cadl))
-		opregion->acpi->cadl[i] = 0;
+		opregion_write32(&opregion->acpi->cadl[i], 0);
 }
 
 static void swsci_setup(struct intel_display *display)
@@ -913,7 +1008,7 @@ int intel_opregion_setup(struct intel_display *display)
 		goto err_memremap;
 	}
 
-	memcpy(buf, base, sizeof(buf));
+	opregion_memcpy(buf, base, sizeof(buf));
 
 	if (memcmp(buf, OPREGION_SIGNATURE, 16)) {
 		drm_dbg(display->drm, "opregion signature mismatch\n");
@@ -923,11 +1018,11 @@ int intel_opregion_setup(struct intel_display *display)
 	opregion->header = base;
 
 	drm_dbg(display->drm, "ACPI OpRegion version %u.%u.%u\n",
-		opregion->header->over.major,
-		opregion->header->over.minor,
-		opregion->header->over.revision);
+		opregion_read8(&opregion->header->over.major),
+		opregion_read8(&opregion->header->over.minor),
+		opregion_read8(&opregion->header->over.revision));
 
-	mboxes = opregion->header->mboxes;
+	mboxes = opregion_read32(&opregion->header->mboxes);
 	if (mboxes & MBOX_ACPI) {
 		drm_dbg(display->drm, "Public ACPI methods supported\n");
 		opregion->acpi = base + OPREGION_ACPI_OFFSET;
@@ -937,11 +1032,11 @@ int intel_opregion_setup(struct intel_display *display)
 		 * triggering the AML code doing the notifation, which may be
 		 * broken as Windows also seems to disable these.
 		 */
-		opregion->acpi->chpd = 1;
+		opregion_write32(&opregion->acpi->chpd, 1);
 	}
 
 	if (mboxes & MBOX_SWSCI) {
-		u8 major = opregion->header->over.major;
+		u8 major = opregion_read8(&opregion->header->over.major);
 
 		if (major >= 3) {
 			drm_err(display->drm, "SWSCI Mailbox #2 present for opregion v3.x, ignoring\n");
@@ -958,7 +1053,7 @@ int intel_opregion_setup(struct intel_display *display)
 		drm_dbg(display->drm, "ASLE supported\n");
 		opregion->asle = base + OPREGION_ASLE_OFFSET;
 
-		opregion->asle->ardy = ASLE_ARDY_NOT_READY;
+		opregion_write32(&opregion->asle->ardy, ASLE_ARDY_NOT_READY);
 	}
 
 	if (mboxes & MBOX_ASLE_EXT) {
@@ -973,9 +1068,10 @@ int intel_opregion_setup(struct intel_display *display)
 	if (dmi_check_system(intel_no_opregion_vbt))
 		goto out;
 
-	if (opregion->header->over.major >= 2 && opregion->asle &&
-	    opregion->asle->rvda && opregion->asle->rvds) {
-		resource_size_t rvda = opregion->asle->rvda;
+	if (opregion_read8(&opregion->header->over.major) >= 2 && opregion->asle &&
+	    opregion_read64(&opregion->asle->rvda) &&
+	    opregion_read32(&opregion->asle->rvds)) {
+		resource_size_t rvda = opregion_read64(&opregion->asle->rvda);
 
 		/*
 		 * opregion 2.0: rvda is the physical VBT address.
@@ -983,23 +1079,23 @@ int intel_opregion_setup(struct intel_display *display)
 		 * opregion 2.1+: rvda is unsigned, relative offset from
 		 * opregion base, and should never point within opregion.
 		 */
-		if (opregion->header->over.major > 2 ||
-		    opregion->header->over.minor >= 1) {
+		if (opregion_read8(&opregion->header->over.major) > 2 ||
+		    opregion_read8(&opregion->header->over.minor) >= 1) {
 			drm_WARN_ON(display->drm, rvda < OPREGION_SIZE);
 
 			rvda += asls;
 		}
 
-		opregion->rvda = memremap(rvda, opregion->asle->rvds,
-					  MEMREMAP_WB);
+		vbt_size = opregion_read32(&opregion->asle->rvds);
+		opregion->rvda = memremap(rvda, vbt_size, MEMREMAP_WB);
 
 		vbt = opregion->rvda;
-		vbt_size = opregion->asle->rvds;
-		if (intel_bios_is_valid_vbt(display, vbt, vbt_size)) {
+		err = opregion_set_vbt(display, vbt, vbt_size);
+		if (err == -ENOMEM)
+			goto err_out;
+		if (!err) {
 			drm_dbg_kms(display->drm,
 				    "Found valid VBT in ACPI OpRegion (RVDA)\n");
-			opregion->vbt = vbt;
-			opregion->vbt_size = vbt_size;
 			goto out;
 		} else {
 			drm_dbg_kms(display->drm,
@@ -1020,11 +1116,12 @@ int intel_opregion_setup(struct intel_display *display)
 	vbt_size = (mboxes & MBOX_ASLE_EXT) ?
 		OPREGION_ASLE_EXT_OFFSET : OPREGION_SIZE;
 	vbt_size -= OPREGION_VBT_OFFSET;
-	if (intel_bios_is_valid_vbt(display, vbt, vbt_size)) {
+	err = opregion_set_vbt(display, vbt, vbt_size);
+	if (err == -ENOMEM)
+		goto err_out;
+	if (!err) {
 		drm_dbg_kms(display->drm,
 			    "Found valid VBT in ACPI OpRegion (Mailbox #4)\n");
-		opregion->vbt = vbt;
-		opregion->vbt_size = vbt_size;
 	} else {
 		drm_dbg_kms(display->drm,
 			    "Invalid VBT in ACPI OpRegion (Mailbox #4)\n");
@@ -1034,6 +1131,8 @@ out:
 	return 0;
 
 err_out:
+	if (opregion->rvda)
+		memunmap(opregion->rvda);
 	memunmap(base);
 err_memremap:
 	kfree(opregion);
@@ -1112,17 +1211,19 @@ const struct drm_edid *intel_opregion_get_edid(struct intel_connector *connector
 	struct intel_display *display = to_intel_display(connector);
 	struct intel_opregion *opregion = display->opregion;
 	const struct drm_edid *drm_edid;
-	const void *edid;
+	u8 edid[3 * EDID_LENGTH];
 	int len;
 
 	if (!opregion || !opregion->asle_ext)
 		return NULL;
 
-	edid = opregion->asle_ext->bddc;
-
 	/* Validity corresponds to number of 128-byte blocks */
-	len = (opregion->asle_ext->phed & ASLE_PHED_EDID_VALID_MASK) * 128;
-	if (!len || mem_is_zero(edid, len))
+	len = (opregion_read32(&opregion->asle_ext->phed) & ASLE_PHED_EDID_VALID_MASK) * 128;
+	if (!len)
+		return NULL;
+
+	opregion_memcpy(edid, opregion->asle_ext->bddc, len);
+	if (mem_is_zero(edid, len))
 		return NULL;
 
 	drm_edid = drm_edid_alloc(edid, len);
@@ -1169,11 +1270,12 @@ bool intel_opregion_headless_sku(struct intel_display *display)
 
 	header = opregion->header;
 
-	if (!header || header->over.major < 2 ||
-	    (header->over.major == 2 && header->over.minor < 3))
+	if (!header || opregion_read8(&header->over.major) < 2 ||
+	    (opregion_read8(&header->over.major) == 2 &&
+	     opregion_read8(&header->over.minor) < 3))
 		return false;
 
-	return opregion->header->pcon & PCON_HEADLESS_SKU;
+	return opregion_read32(&opregion->header->pcon) & PCON_HEADLESS_SKU;
 }
 
 void intel_opregion_register(struct intel_display *display)
@@ -1205,13 +1307,13 @@ static void intel_opregion_resume_display(struct intel_display *display)
 		 * Right now, all the events are handled by the ACPI video
 		 * module. We don't actually need to do anything with them.
 		 */
-		opregion->acpi->csts = 0;
-		opregion->acpi->drdy = 1;
+		opregion_write32(&opregion->acpi->csts, 0);
+		opregion_write32(&opregion->acpi->drdy, 1);
 	}
 
 	if (opregion->asle) {
-		opregion->asle->tche = ASLE_TCHE_BLC_EN;
-		opregion->asle->ardy = ASLE_ARDY_READY;
+		opregion_write32(&opregion->asle->tche, ASLE_TCHE_BLC_EN);
+		opregion_write32(&opregion->asle->ardy, ASLE_ARDY_READY);
 	}
 
 	/* Some platforms abuse the _DSM to enable MUX */
@@ -1236,12 +1338,12 @@ static void intel_opregion_suspend_display(struct intel_display *display)
 	struct intel_opregion *opregion = display->opregion;
 
 	if (opregion->asle)
-		opregion->asle->ardy = ASLE_ARDY_NOT_READY;
+		opregion_write32(&opregion->asle->ardy, ASLE_ARDY_NOT_READY);
 
 	cancel_work_sync(&opregion->asle_work);
 
 	if (opregion->acpi)
-		opregion->acpi->drdy = 0;
+		opregion_write32(&opregion->acpi->drdy, 0);
 }
 
 void intel_opregion_suspend(struct intel_display *display, pci_power_t state)
@@ -1282,6 +1384,7 @@ void intel_opregion_cleanup(struct intel_display *display)
 	memunmap(opregion->header);
 	if (opregion->rvda)
 		memunmap(opregion->rvda);
+	kfree(opregion->vbt);
 	kfree(opregion);
 	display->opregion = NULL;
 }
@@ -1290,9 +1393,17 @@ static int intel_opregion_show(struct seq_file *m, void *unused)
 {
 	struct intel_display *display = m->private;
 	struct intel_opregion *opregion = display->opregion;
+	void *buf;
 
-	if (opregion)
-		seq_write(m, opregion->header, OPREGION_SIZE);
+	if (!opregion)
+		return 0;
+
+	buf = opregion_memdup(opregion->header, OPREGION_SIZE);
+	if (!buf)
+		return -ENOMEM;
+
+	seq_write(m, buf, OPREGION_SIZE);
+	kfree(buf);
 
 	return 0;
 }
