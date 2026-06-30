@@ -355,31 +355,39 @@ static struct pkvm_ptdev *iommu_add_ptdev(struct pkvm_iommu *iommu, u16 bdf, u32
 			return NULL;
 	}
 
+	PKVM_ASSERT(list_empty(&ptdev->iommu_node));
 	list_add_tail(&ptdev->iommu_node, &iommu->ptdev_head);
 	return ptdev;
 }
 
 static void iommu_del_ptdev(struct pkvm_iommu *iommu, struct pkvm_ptdev *ptdev)
 {
+	PKVM_ASSERT(!list_empty(&ptdev->iommu_node));
 	list_del_init(&ptdev->iommu_node);
 	pkvm_put_ptdev(ptdev);
 }
 
-static int iommu_audit_did(struct pkvm_iommu *iommu, u16 did, int shadow_vm_handle)
+/* Assumes iommu->lock and ptdev->lock to be held */
+static int iommu_audit_did(struct pkvm_iommu *iommu, struct pkvm_ptdev *ptdev, u16 did)
 {
 	struct pkvm_ptdev *tmp;
 	int ret = 0;
 
 	list_for_each_entry(tmp, &iommu->ptdev_head, iommu_node) {
-		if (tmp->shadow_vm_handle != shadow_vm_handle) {
-			if (tmp->did == did) {
-				/*
-				 * The devices belong to different VMs but behind
-				 * the same IOMMU, cannot use the same did.
-				 */
-				ret = -EPERM;
-				break;
-			}
+		if (tmp == ptdev)
+			continue;
+
+		pkvm_spin_lock(&tmp->lock);
+		if (tmp->shadow_vm_handle != ptdev->shadow_vm_handle && tmp->did == did) {
+			/*
+			 * The devices belonging to different VMs but behind
+			 * the same IOMMU, cannot use the same did.
+			 */
+			ret = -EPERM;
+		}
+		pkvm_spin_unlock(&tmp->lock);
+		if (ret != 0) {
+			break;
 		}
 	}
 
@@ -576,6 +584,7 @@ static int iommu_pgt_sync(struct pkvm_pgtable *src,
 	return iommu_pgt_sync_range(src, dst, 0, size, vm_handle);
 }
 
+/* Assumes ptdev->lock to be held */
 static int sync_attached_shadow_pgt(struct pkvm_ptdev *ptdev, struct shadow_pgt_sync_data *sdata)
 {
 	int ret;
@@ -694,34 +703,52 @@ static int iommu_pgt_unmap_by_hpa(struct pkvm_pgtable *pgt,
 	return ret;
 }
 
+/* The caller must hold vm->lock */
 int pkvm_iommu_unmap_by_hpa(struct pkvm_shadow_vm *vm, unsigned long hpa, unsigned long size)
 {
-	struct list_head *ptdev_head = &vm->ptdev_head;
 	struct pkvm_ptdev *ptdev;
-	struct pkvm_iommu *iommu;
 	int ret = 0;
 
-	list_for_each_entry(ptdev, ptdev_head, vm_node) {
-		if (ptdev_attached_to_vm(ptdev)) {
-			bool unmapped = false;
-			ret = iommu_pgt_unmap_by_hpa(ptdev->pgt, hpa, size, &unmapped);
-			if (ret) {
-				pkvm_err("%s: iommu unmap failed hpa=0x%lx size=0x%lx\n",
-					 __func__, hpa, size);
-				return ret;
-			}
+	list_for_each_entry(ptdev, &vm->ptdev_head, vm_node) {
+		bool unmapped = false;
+		u16 did;
+		u16 bdf;
+		u32 pasid;
+		struct pkvm_iommu *iommu;
 
-			iommu = bdf_pasid_to_iommu(ptdev->bdf, ptdev->pasid);
-			if (!iommu) {
-				pkvm_err("%s: no iommu for bdf=0x%x pasid=0x%x\n",
-					 __func__, ptdev->bdf, ptdev->pasid);
-				ret = -ENODEV;
-				continue;
-			}
+		pkvm_spin_lock(&ptdev->lock);
 
-			if (unmapped && ptdev->did)
-				flush_iotlb(iommu, ptdev->did, 0, 0, DMA_TLB_DSI_FLUSH);
+		if (!ptdev_attached_to_vm(ptdev)) {
+			pkvm_spin_unlock(&ptdev->lock);
+			continue;
 		}
+
+		ret = iommu_pgt_unmap_by_hpa(ptdev->pgt, hpa, size, &unmapped);
+		if (ret) {
+			pkvm_err("%s: iommu unmap failed hpa=0x%lx size=0x%lx\n",
+				 __func__, hpa, size);
+			pkvm_spin_unlock(&ptdev->lock);
+			break;
+		}
+
+		did = ptdev->did;
+		bdf = ptdev->bdf;
+		pasid = ptdev->pasid;
+
+		pkvm_spin_unlock(&ptdev->lock);
+
+		if (!unmapped || !did)
+			continue;
+
+		iommu = bdf_pasid_to_iommu(bdf, pasid);
+		if (!iommu) {
+			pkvm_err("%s: no iommu for bdf=0x%x pasid=0x%x\n",
+				 __func__, ptdev->bdf, ptdev->pasid);
+			ret = -ENODEV;
+			continue;
+		}
+
+		flush_iotlb(iommu, did, 0, 0, DMA_TLB_DSI_FLUSH);
 	}
 
 	return ret;
@@ -737,7 +764,7 @@ static bool sync_shadow_context_entry(struct id_sync_data *sdata)
 	struct pkvm_pgtable_cap cap;
 	bool updated = false;
 	u8 tt, aw;
-	u16 bdf, did;
+	u16 bdf;
 
 	if (iommu_sm_active(iommu)) {
 		if (sdata->guest_ptep && sdata->shadow_pa) {
@@ -766,8 +793,11 @@ static bool sync_shadow_context_entry(struct id_sync_data *sdata)
 
 		if (!sdata->guest_ptep) {
 			if (context_lm_is_present(shadow_ce)) {
+				pkvm_spin_lock(&ptdev->lock);
 				pkvm_setup_ptdev_vpgt(ptdev, 0, NULL, NULL, NULL, false);
 				pkvm_setup_ptdev_did(ptdev, 0);
+				pkvm_spin_unlock(&ptdev->lock);
+
 				iommu_del_ptdev(iommu, ptdev);
 
 				goto update_shadow_ce;
@@ -775,9 +805,14 @@ static bool sync_shadow_context_entry(struct id_sync_data *sdata)
 			return false;
 		}
 
-		did = context_lm_get_did(guest_ce);
-		if (iommu_audit_did(iommu, did, ptdev->shadow_vm_handle))
+		pkvm_spin_lock(&ptdev->lock);
+		u16 did = context_lm_get_did(guest_ce);
+		if (iommu_audit_did(iommu, ptdev, did)) {
+			pkvm_spin_unlock(&ptdev->lock);
 			return false;
+		}
+
+		pkvm_setup_ptdev_did(ptdev, did);
 
 		tt = context_lm_get_tt(guest_ce);
 		switch (tt) {
@@ -789,6 +824,7 @@ static bool sync_shadow_context_entry(struct id_sync_data *sdata)
 
 				pkvm_setup_ptdev_vpgt(ptdev, 0, NULL, NULL, NULL, false);
 				pkvm_setup_ptdev_did(ptdev, 0);
+				pkvm_spin_unlock(&ptdev->lock);
 
 				/*
 				 * TODO: our error reporting to the host for invalid
@@ -814,9 +850,11 @@ static bool sync_shadow_context_entry(struct id_sync_data *sdata)
 					 * The original guest IOTLB invalidation will be aborted on error, but
 					 * sync may already have unmapped stale iommu_pgt leaves. Flush the DID now.
 					 */
-					flush_iotlb(iommu, did, 0, 0, DMA_TLB_DSI_FLUSH);
+					flush_iotlb(iommu, ptdev->did, 0, 0, DMA_TLB_DSI_FLUSH);
 					pkvm_setup_ptdev_did(ptdev, 0);
 					memset(&tmp, 0, sizeof(tmp));
+					pkvm_spin_unlock(&ptdev->lock);
+
 					goto update_shadow_ce;
 				}
 			}
@@ -834,13 +872,15 @@ static bool sync_shadow_context_entry(struct id_sync_data *sdata)
 
 			pkvm_setup_ptdev_vpgt(ptdev, 0, NULL, NULL, NULL, false);
 			pkvm_setup_ptdev_did(ptdev, 0);
+			pkvm_spin_unlock(&ptdev->lock);
+
 			goto update_shadow_ce;
 		}
 
-		pkvm_setup_ptdev_did(ptdev, did);
-
-		if (!is_pgt_ops_ept(ptdev->pgt))
+		if (!is_pgt_ops_ept(ptdev->pgt)) {
+			pkvm_spin_unlock(&ptdev->lock);
 			return false;
+		}
 
 		tmp = *guest_ce;
 
@@ -853,6 +893,7 @@ static bool sync_shadow_context_entry(struct id_sync_data *sdata)
 		aw = (ptdev->pgt->level == 3) ? 1 :
 		     (ptdev->pgt->level == 4) ? 2 : 3;
 		context_lm_set_aw(&tmp, aw);
+		pkvm_spin_unlock(&ptdev->lock);
 	}
 
 update_shadow_ce:
@@ -890,6 +931,7 @@ static bool sync_shadow_pasid_dir_entry(struct id_sync_data *sdata)
 	return false;
 }
 
+/* Assumes ptdev->lock to be held */
 static int reset_shadow_iommu_pgt(struct pkvm_ptdev *ptdev)
 {
 	unsigned long size;
@@ -904,6 +946,36 @@ static int reset_shadow_iommu_pgt(struct pkvm_ptdev *ptdev)
 	return pkvm_pgtable_unmap(pgt, 0, size, NULL);
 }
 
+/* Assumes ptdev->lock to be held */
+static bool handle_unsupported_pasid_entry(struct pkvm_ptdev *ptdev, struct id_sync_data *sdata)
+{
+	struct pasid_entry *shadow_pte = sdata->shadow_ptep;
+	struct pasid_entry tmp_pte = {0};
+
+	if (ptdev_attached_to_vm(ptdev)) {
+		int ret = reset_shadow_iommu_pgt(ptdev);
+		if (ret) {
+			pkvm_err("pkvm: failed to unmap IOVAs ret=%d bdf=0x%x pasid=0x%x\n", ret, ptdev->bdf, ptdev->pasid);
+			return false;
+		}
+	}
+	pkvm_setup_ptdev_vpgt(ptdev, 0, NULL, NULL, NULL, false);
+	pkvm_setup_ptdev_did(ptdev, 0);
+
+	return pasid_copy_entry(shadow_pte, &tmp_pte);
+}
+
+static bool pasid_table_type_supported(u64 type)
+{
+	switch (type) {
+		case PASID_ENTRY_PGTT_FL_ONLY:
+		case PASID_ENTRY_PGTT_PT:
+			return true;
+		default:
+			return false;
+	}
+}
+
 /* sync pasid table entry when guest_ptep valid, otherwise un-present it */
 static bool sync_shadow_pasid_table_entry(struct id_sync_data *sdata)
 {
@@ -914,8 +986,9 @@ static bool sync_shadow_pasid_table_entry(struct id_sync_data *sdata)
 	struct pasid_entry *shadow_pte = sdata->shadow_ptep, tmp_pte = {0};
 	struct pasid_entry *guest_pte;
 	bool synced = false;
-	bool attached, root_changed = false;
-	u64 guest_type, type, aw;
+	bool attached;
+	u64 type, aw;
+	u16 did;
 	int ret = 0;
 
 	if (!ptdev) {
@@ -932,14 +1005,20 @@ static bool sync_shadow_pasid_table_entry(struct id_sync_data *sdata)
 			 * a ptdev's vpgt/did should be reset as well as
 			 * deleting ptdev from this iommu.
 			 */
+			pkvm_spin_lock(&ptdev->lock);
 			if (ptdev_attached_to_vm(ptdev) &&
 			    reset_shadow_iommu_pgt(ptdev)) {
 				pkvm_err("pkvm: failed to unmap IOVAs for removed PASID bdf=0x%x pasid=0x%x\n",
 					 ptdev->bdf, ptdev->pasid);
+
+				pkvm_spin_unlock(&ptdev->lock);
 				return false;
 			}
+
 			pkvm_setup_ptdev_vpgt(ptdev, 0, NULL, NULL, NULL, false);
 			pkvm_setup_ptdev_did(ptdev, 0);
+			pkvm_spin_unlock(&ptdev->lock);
+
 			iommu_del_ptdev(iommu, ptdev);
 
 			synced = pasid_copy_entry(shadow_pte, &tmp_pte);
@@ -948,79 +1027,22 @@ static bool sync_shadow_pasid_table_entry(struct id_sync_data *sdata)
 	}
 
 	guest_pte = sdata->guest_ptep;
-	guest_type = pasid_pte_get_pgtt(guest_pte);
-	type = guest_type;
+	type = pasid_pte_get_pgtt(guest_pte);
+
+	pkvm_spin_lock(&ptdev->lock);
 	attached = ptdev_attached_to_vm(ptdev);
-	if (attached && guest_type == PASID_ENTRY_PGTT_FL_ONLY &&
-	    ptdev->vpgt.root_pa &&
-	    ptdev->vpgt.root_pa != pasid_get_flptr(guest_pte)) {
-		ret = reset_shadow_iommu_pgt(ptdev);
-		if (ret) {
-			pkvm_err("pkvm: failed to unmap IOVAs for root switch bdf=0x%x pasid=0x%x old=0x%lx new=0x%llx\n",
-				 ptdev->bdf, ptdev->pasid, ptdev->vpgt.root_pa,
-				 (unsigned long long)pasid_get_flptr(guest_pte));
-			return false;
-		}
-		root_changed = true;
-	}
-	if (attached && guest_type != PASID_ENTRY_PGTT_FL_ONLY &&
-	    reset_shadow_iommu_pgt(ptdev)) {
-		pkvm_err("pkvm: failed to unmap IOVAs for mode switch bdf=0x%x pasid=0x%x\n",
-			 ptdev->bdf, ptdev->pasid);
-		return false;
-	}
-	if (type == PASID_ENTRY_PGTT_FL_ONLY) {
-		struct pkvm_pgtable_cap cap;
 
-		if (attached)
-			/*
-			 * For the attached ptdev, use SL Only mode with
-			 * using ptdev->pgt so that the translation is
-			 * totally controlled by pkvm.
-			 */
-			type = PASID_ENTRY_PGTT_SL_ONLY;
-		else
-			/*
-			 * For the other ptdev, pkvm IOMMU will use nested
-			 * translation to add one more layer translation to
-			 * guarantee the protection. This one more layer is the
-			 * primary VM's EPT.
-			 */
-			type = PASID_ENTRY_PGTT_NESTED;
-
-		/* ptdev vpgt can be initialized with flptr */
-		cap.level = pasid_get_flpm(guest_pte) == 0 ? 4 : 5;
-		cap.allowed_pgsz = pkvm_hyp->mmu_cap.allowed_pgsz;
-		pkvm_setup_ptdev_vpgt(ptdev, pasid_get_flptr(guest_pte),
-				      &viommu_mm_ops, &mmu_ops, &cap, false);
-	} else if (type == PASID_ENTRY_PGTT_PT) {
-		/*
-		 * When host IOMMU driver is using pass-through mode, pkvm
-		 * IOMMU will actually use the second-level only translation
-		 * to guarantee the protection. This second-level is als
-		 * the EPT.
-		 */
-		type = PASID_ENTRY_PGTT_SL_ONLY;
-	} else {
-		/*
-		 * As the host IOMMU driver in the pkvm enabled kernel has
-		 * already been configured to use first-level only or
-		 * pass-through mode, it will not use any other mode. But
-		 * in case this has happened, reset the ptdev vpgt/did while
-		 * keep ptdev linked to this IOMMU, and clear the shadow entry
-		 * so that not to support it.
-		 */
-		pkvm_setup_ptdev_vpgt(ptdev, 0, NULL, NULL, NULL, false);
-		pkvm_setup_ptdev_did(ptdev, 0);
-
+	if (!pasid_table_type_supported(type)) {
 		pkvm_err("pkvm: unsupported pasid type %lld\n", type);
 
-		return pasid_copy_entry(shadow_pte, &tmp_pte);
+		synced = handle_unsupported_pasid_entry(ptdev, sdata);
+
+		pkvm_spin_unlock(&ptdev->lock);
+		return synced;
 	}
 
-	pkvm_setup_ptdev_did(ptdev, pasid_get_domain_id(guest_pte));
-
-	if (iommu_audit_did(iommu, ptdev->did, ptdev->shadow_vm_handle))
+	did = pasid_get_domain_id(guest_pte);
+	if (iommu_audit_did(iommu, ptdev, did)) {
 		/*
 		 * It is possible that this ptdev will be attached to a protected
 		 * VM so primary VM allocates the same did used by this protected
@@ -1040,29 +1062,95 @@ static bool sync_shadow_pasid_table_entry(struct id_sync_data *sdata)
 		 * If not the above cases but primary VM does this by purpose, also
 		 * not sync the pasid table entry to guarantee the isolation.
 		 */
+		pkvm_spin_unlock(&ptdev->lock);
 		return false;
-
-	if (attached && guest_type == PASID_ENTRY_PGTT_FL_ONLY) {
-		if (!root_changed) {
-			ret = sync_attached_shadow_pgt(ptdev, sdata->spgt_data);
-		} else {
-			ret = sync_attached_shadow_pgt(ptdev, NULL);
-		}
-
-		if (ret) {
-			pkvm_err("pkvm: pasid IOVA sync error %d bdf=0x%x pasid=0x%x\n",
-				 ret, ptdev->bdf, ptdev->pasid);
-			pkvm_setup_ptdev_did(ptdev, 0);
-			return pasid_copy_entry(shadow_pte, &tmp_pte);
-		}
 	}
+
+	if (type == PASID_ENTRY_PGTT_FL_ONLY) {
+		struct pkvm_pgtable_cap cap;
+		struct shadow_pgt_sync_data *sync_data = sdata->spgt_data;
+
+		if (attached) {
+			if (ptdev->vpgt.root_pa && ptdev->vpgt.root_pa != pasid_get_flptr(guest_pte)) {
+				/* Root changed, teardown mappings */
+				ret = reset_shadow_iommu_pgt(ptdev);
+				if (ret) {
+					pkvm_err("pkvm: failed to unmap IOVAs for root switch ret=%d bdf=0x%x pasid=0x%x old=0x%lx new=0x%llx\n",
+						 ret, ptdev->bdf, ptdev->pasid, ptdev->vpgt.root_pa, (unsigned long long) pasid_get_flptr(guest_pte));
+
+					pkvm_spin_unlock(&ptdev->lock);
+					return false;
+				}
+
+				/* Full sync */
+				sync_data = NULL;
+			}
+
+			/*
+			 * For the attached ptdev, use SL Only mode with
+			 * using ptdev->pgt so that the translation is
+			 * totally controlled by pkvm.
+			 */
+			type = PASID_ENTRY_PGTT_SL_ONLY;
+		} else {
+			/*
+			 * For the other ptdev, pkvm IOMMU will use nested
+			 * translation to add one more layer translation to
+			 * guarantee the protection. This one more layer is the
+			 * primary VM's EPT.
+			 */
+			type = PASID_ENTRY_PGTT_NESTED;
+		}
+
+		/* ptdev vpgt can be initialized with flptr */
+		cap.level = pasid_get_flpm(guest_pte) == 0 ? 4 : 5;
+		cap.allowed_pgsz = pkvm_hyp->mmu_cap.allowed_pgsz;
+		pkvm_setup_ptdev_vpgt(ptdev, pasid_get_flptr(guest_pte),
+				      &viommu_mm_ops, &mmu_ops, &cap, false);
+
+		if (attached) {
+			ret = sync_attached_shadow_pgt(ptdev, sync_data);
+			if (ret) {
+				pkvm_err("pkvm: pasid IOVA sync error ret=%d bdf=0x%x pasid=0x%x\n",
+					 ret, ptdev->bdf, ptdev->pasid);
+
+				pkvm_setup_ptdev_did(ptdev, 0);
+
+				pkvm_spin_unlock(&ptdev->lock);
+				return pasid_copy_entry(shadow_pte, &tmp_pte);
+			}
+		}
+	} else if (type == PASID_ENTRY_PGTT_PT) {
+		if (attached) {
+			/* Teardown previous mappings */
+			ret = reset_shadow_iommu_pgt(ptdev);
+			if (ret) {
+				pkvm_err("pkvm: failed to unmap IOVAs ret=%d bdf=0x%x pasid=0x%x\n",
+					 ret, ptdev->bdf, ptdev->pasid);
+
+				pkvm_spin_unlock(&ptdev->lock);
+				return false;
+			}
+		}
+
+		/*
+		 * When host IOMMU driver is using pass-through mode, pkvm
+		 * IOMMU will actually use the second-level only translation
+		 * to guarantee the protection. This second-level is also the EPT.
+		 */
+		type = PASID_ENTRY_PGTT_SL_ONLY;
+	}
+
+	pkvm_setup_ptdev_did(ptdev, did);
 
 	/*
 	 * ptdev->pgt will be used as second-level translation table
 	 * which should be EPT format.
 	 */
-	if (!is_pgt_ops_ept(ptdev->pgt))
+	if (!is_pgt_ops_ept(ptdev->pgt)) {
+		pkvm_spin_unlock(&ptdev->lock);
 		return false;
+	}
 
 	/*
 	 * Copy all the bits from guest_pte. As the translation type will
@@ -1088,6 +1176,8 @@ static bool sync_shadow_pasid_table_entry(struct id_sync_data *sdata)
 	pasid_set_address_width(&tmp_pte, aw);
 	pasid_set_ssade(&tmp_pte, 0);
 	pasid_set_ssee(&tmp_pte, 0);
+
+	pkvm_spin_unlock(&ptdev->lock);
 
 	return pasid_copy_entry(shadow_pte, &tmp_pte);
 }
@@ -2037,17 +2127,23 @@ static int sync_ptdev_shadow_pgt(struct pkvm_iommu *iommu,
 	}
 
 	list_for_each_entry(ptdev, &iommu->ptdev_head, iommu_node) {
-		if (ptdev->did != did || ptdev->pasid != pasid)
+		pkvm_spin_lock(&ptdev->lock);
+		if (ptdev->did != did || ptdev->pasid != pasid) {
+			pkvm_spin_unlock(&ptdev->lock);
 			continue;
+		}
 
 		matched = true;
 
 		/* Unattached scalable ptdevs stay in nested mode: no per-ptdev mappings. */
-		if (!ptdev_attached_to_vm(ptdev))
+		if (!ptdev_attached_to_vm(ptdev)) {
+			pkvm_spin_unlock(&ptdev->lock);
 			continue;
+		}
 
 		*flush = true;
 		ret = sync_attached_shadow_pgt(ptdev, sdata);
+		pkvm_spin_unlock(&ptdev->lock);
 		if (ret)
 			break;
 	}
@@ -2107,6 +2203,33 @@ static int iotlb_pasid_invalidate(struct pkvm_iommu *iommu, struct qi_desc *desc
 	return ret;
 }
 
+/* Assumes iommu->lock to be held */
+static int sync_lm_ptdevs_for_did(struct pkvm_iommu *iommu, u16 did,
+				  struct shadow_pgt_sync_data *sdata)
+{
+	struct pkvm_ptdev *ptdev, *tmp;
+	int ret = 0;
+
+	list_for_each_entry_safe(ptdev, tmp, &iommu->ptdev_head, iommu_node) {
+		u16 ptdev_did;
+		u16 ptdev_bdf;
+
+		pkvm_spin_lock(&ptdev->lock);
+		ptdev_did = ptdev->did;
+		ptdev_bdf = ptdev->bdf;
+		pkvm_spin_unlock(&ptdev->lock);
+
+		if (ptdev_did != did)
+			continue;
+
+		ret = sync_shadow_id(iommu, ptdev_bdf, ptdev_bdf + 1, did, sdata);
+		if (ret)
+			break;
+	}
+
+	return ret;
+}
+
 static int iotlb_lm_invalidate(struct pkvm_iommu *iommu, struct qi_desc *desc)
 {
 	u16 did = QI_DESC_IOTLB_DID(desc->qw0);
@@ -2114,7 +2237,6 @@ static int iotlb_lm_invalidate(struct pkvm_iommu *iommu, struct qi_desc *desc)
 	u64 addr = QI_DESC_IOTLB_ADDR(desc->qw1);
 	u64 mask = ((u64)-1) << (VTD_PAGE_SHIFT + QI_DESC_IOTLB_AM(desc->qw1));
 	struct shadow_pgt_sync_data data;
-	struct pkvm_ptdev *p;
 	int ret = 0;
 
 	switch (granu) {
@@ -2127,12 +2249,7 @@ static int iotlb_lm_invalidate(struct pkvm_iommu *iommu, struct qi_desc *desc)
 			 __func__, iommu->iommu.seq_id, did);
 
 		/* optimization: walk just the needed devices, not the entire bdf space */
-		list_for_each_entry(p, &iommu->ptdev_head, iommu_node)
-			if (p->did == did) {
-				ret = sync_shadow_id(iommu, p->bdf, p->bdf + 1, did, NULL);
-				if (ret)
-					break;
-			}
+		ret = sync_lm_ptdevs_for_did(iommu, did, NULL);
 		break;
 	case DMA_TLB_PSI_FLUSH:
 		data.vaddr = addr & mask;
@@ -2141,12 +2258,7 @@ static int iotlb_lm_invalidate(struct pkvm_iommu *iommu, struct qi_desc *desc)
 			 __func__, iommu->iommu.seq_id, did, data.vaddr, data.vaddr_end);
 
 		/* optimization: walk just the needed devices, not the entire bdf space */
-		list_for_each_entry(p, &iommu->ptdev_head, iommu_node)
-			if (p->did == did) {
-				ret = sync_shadow_id(iommu, p->bdf, p->bdf + 1, did, &data);
-				if (ret)
-					break;
-			}
+		ret = sync_lm_ptdevs_for_did(iommu, did, &data);
 		break;
 	default:
 		pkvm_err("pkvm: %s: iommu%d: invalid granularity %lld\n",
@@ -2653,6 +2765,16 @@ struct pkvm_iommu *bdf_pasid_to_iommu(u16 bdf, u32 pasid)
 	return find;
 }
 
+static u16 ptdev_read_did_locked(struct pkvm_ptdev *ptdev)
+{
+	u16 did;
+
+	pkvm_spin_lock(&ptdev->lock);
+	did = ptdev->did;
+	pkvm_spin_unlock(&ptdev->lock);
+
+	return did;
+}
 /*
  * pkvm_iommu_sync() - Sync IOMMU context/pasid entry according to a ptdev
  *
@@ -2673,8 +2795,6 @@ int pkvm_iommu_sync(u16 bdf, u32 pasid)
 	if (!ptdev)
 		return -ENODEV;
 
-	old_did = ptdev->did;
-
 	bool sm_active = iommu_sm_active(iommu);
 	if (sm_active) {
 		id_addr = ((unsigned long)bdf << DEVFN_SHIFT) |
@@ -2686,9 +2806,13 @@ int pkvm_iommu_sync(u16 bdf, u32 pasid)
 	}
 
 	pkvm_spin_lock(&iommu->lock);
+	old_did = ptdev_read_did_locked(ptdev);
+
 	ret = sync_shadow_id(iommu, id_addr, id_addr_end, 0, NULL);
 	if (!ret) {
-		if (old_did != ptdev->did) {
+		u16 new_did = ptdev_read_did_locked(ptdev);
+
+		if (old_did != new_did) {
 			/* Flush pasid cache and IOTLB for the valid old_did */
 			if (sm_active)
 				flush_pasid_cache(iommu, old_did, QI_PC_PASID_SEL, pasid);
@@ -2699,10 +2823,10 @@ int pkvm_iommu_sync(u16 bdf, u32 pasid)
 
 		/* Flush pasid cache and IOTLB to make sure no stale TLB for the new did */
 		if (sm_active)
-			flush_pasid_cache(iommu, ptdev->did, QI_PC_PASID_SEL, pasid);
+			flush_pasid_cache(iommu, new_did, QI_PC_PASID_SEL, pasid);
 		else
-			flush_context_cache(iommu, ptdev->did, 0, 0, DMA_CCMD_DOMAIN_INVL);
-		flush_iotlb(iommu, ptdev->did, 0, 0, DMA_TLB_DSI_FLUSH);
+			flush_context_cache(iommu, new_did, 0, 0, DMA_CCMD_DOMAIN_INVL);
+		flush_iotlb(iommu, new_did, 0, 0, DMA_TLB_DSI_FLUSH);
 	}
 	pkvm_spin_unlock(&iommu->lock);
 
@@ -2760,15 +2884,27 @@ static void iommu_flush_iotlb(struct pkvm_iommu *iommu, struct iotlb_flush_data 
 	/* Flush per domain */
 	list_for_each_entry(ptdev, &iommu->ptdev_head, iommu_node) {
 		struct qi_desc *tmp = desc;
+		u16 did;
+		unsigned long root_pa;
+		bool has_pgt;
 		bool did_exist = false;
 		int i;
 
-		if (!ptdev->pgt || ptdev->pgt->root_pa != data->desired_root_pa)
+		pkvm_spin_lock(&ptdev->lock);
+		has_pgt = !!ptdev->pgt;
+		root_pa = has_pgt ? ptdev->pgt->root_pa : 0;
+		did = ptdev->did;
+		pkvm_spin_unlock(&ptdev->lock);
+
+		if (!has_pgt || root_pa != data->desired_root_pa)
+			continue;
+
+		if (!did)
 			continue;
 
 		for (i = 0; i < qi_desc_index; i++, tmp++) {
 			/* The same did is already in descriptor page */
-			if (ptdev->did == QI_DESC_IOTLB_DID(tmp->qw0)) {
+			if (did == QI_DESC_IOTLB_DID(tmp->qw0)) {
 				did_exist = true;
 				break;
 			}
@@ -2776,19 +2912,19 @@ static void iommu_flush_iotlb(struct pkvm_iommu *iommu, struct iotlb_flush_data 
 
 		if (did_exist)
 			continue;
+
 		/*
 		 * Setup the page-selective or domain-selective qi descriptor
 		 * based on IOMMU capability, and submit to HW when qi descriptor
 		 * number reaches to the maximum count.
 		 */
-		if (cap_pgsel_inv(iommu->iommu.cap) &&
-		    data->size_order <= cap_max_amask_val(iommu->iommu.cap))
+		if (cap_pgsel_inv(iommu->iommu.cap) && data->size_order <= cap_max_amask_val(iommu->iommu.cap))
 			setup_iotlb_qi_desc(iommu, desc + qi_desc_index++,
-					    ptdev->did, data->addr, data->size_order,
+					    did, data->addr, data->size_order,
 					    DMA_TLB_PSI_FLUSH);
 		else
 			setup_iotlb_qi_desc(iommu, desc + qi_desc_index++,
-					    ptdev->did, 0, 0,
+					    did, 0, 0,
 					    DMA_TLB_DSI_FLUSH);
 
 		if (qi_desc_index == data->desc_max_index) {

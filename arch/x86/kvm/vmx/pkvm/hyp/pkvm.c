@@ -300,7 +300,7 @@ void pkvm_shadow_vm_unlink_ptdev(struct pkvm_shadow_vm *vm,
 				 struct list_head *node, bool coherency)
 {
 	pkvm_spin_lock(&vm->lock);
-	list_del(node);
+	list_del_init(node);
 	vm->noncoherent_ptdev -= !coherency;
 	pkvm_shadow_sl_iommu_pgt_update_coherency(&vm->pgstate_pgt,
 						  !vm->noncoherent_ptdev);

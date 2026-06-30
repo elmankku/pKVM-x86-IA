@@ -1027,36 +1027,26 @@ static bool is_access_violation(u64 ept_entry, u64 exit_qual)
 static int populate_pgstate_pgt(struct pkvm_pgtable *pgt)
 {
 	struct pkvm_shadow_vm *vm = pgstate_pgt_to_shadow_vm(pgt);
-	struct list_head *ptdev_head = &vm->ptdev_head;
-	struct pkvm_ptdev *ptdev, *tmp;
+	struct pkvm_ptdev *ptdev;
 	u64 *prot_override;
-	bool populated;
 	u64 prot;
 	int ret;
 
-	list_for_each_entry(ptdev, ptdev_head, vm_node) {
+	list_for_each_entry(ptdev, &vm->ptdev_head, vm_node) {
+		pkvm_spin_lock(&ptdev->lock);
+
 		/* No need to populate if vpgt.root_pa doesn't exist */
-		if (!ptdev->vpgt.root_pa)
+		if (!ptdev->vpgt.root_pa) {
+			pkvm_spin_unlock(&ptdev->lock);
 			continue;
-
-		populated = false;
-		list_for_each_entry(tmp, ptdev_head, vm_node) {
-			if (tmp == ptdev)
-				break;
-			if (tmp->vpgt.root_pa == ptdev->vpgt.root_pa) {
-				populated = true;
-				break;
-			}
 		}
-
-		if (populated)
-			continue;
 
 		if (ptdev->vpgt.pgt_ops != pgt->pgt_ops) {
 			/* Populate with EPT format */
 			if (is_pgt_ops_ept(pgt)) {
 				prot = VMX_EPT_RWX_MASK;
 			} else {
+				pkvm_spin_unlock(&ptdev->lock);
 				pkvm_err("pkvm: not supported populating\n");
 				return -EOPNOTSUPP;
 			}
@@ -1067,6 +1057,8 @@ static int populate_pgstate_pgt(struct pkvm_pgtable *pgt)
 
 		ret = pkvm_pgtable_sync_map(&ptdev->vpgt, pgt, prot_override,
 					    pkvm_pgstate_pgt_map_leaf);
+		pkvm_spin_unlock(&ptdev->lock);
+
 		if (ret)
 			return ret;
 	}

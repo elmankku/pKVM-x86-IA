@@ -121,6 +121,10 @@ void pkvm_put_ptdev(struct pkvm_ptdev *ptdev)
 
 	pkvm_spin_lock(&ptdev_lock);
 
+	PKVM_ASSERT(list_empty(&ptdev->iommu_node));
+	PKVM_ASSERT(list_empty(&ptdev->vm_node));
+	PKVM_ASSERT(ptdev->shadow_vm_handle == 0);
+
 	hlist_del(&ptdev->hnode);
 
 	__clear_bit(ptdev->index, ptdevs_bitmap);
@@ -135,12 +139,11 @@ void pkvm_put_ptdev(struct pkvm_ptdev *ptdev)
 	pkvm_spin_unlock(&ptdev_lock);
 }
 
+/* Assumes ptdev->lock to be held */
 void pkvm_setup_ptdev_vpgt(struct pkvm_ptdev *ptdev, unsigned long root_gpa,
 			   struct pkvm_mm_ops *mm_ops, struct pkvm_pgtable_ops *paging_ops,
 			   struct pkvm_pgtable_cap *cap, bool shadowed)
 {
-	pkvm_spin_lock(&ptdev->lock);
-
 	if (pkvm_ptdev_pgt_is_host_iommu_spgt(ptdev) &&
 			(!shadowed || root_gpa != ptdev->vpgt.root_pa) &&
 			!ptdev_attached_to_vm(ptdev)) {
@@ -150,7 +153,7 @@ void pkvm_setup_ptdev_vpgt(struct pkvm_ptdev *ptdev, unsigned long root_gpa,
 
 	if (!root_gpa || root_gpa == INVALID_ADDR || !mm_ops || !paging_ops || !cap) {
 		memset(&ptdev->vpgt, 0, sizeof(struct pkvm_pgtable));
-		goto out;
+		return;
 	}
 
 	ptdev->vpgt.root_pa = root_gpa;
@@ -160,10 +163,9 @@ void pkvm_setup_ptdev_vpgt(struct pkvm_ptdev *ptdev, unsigned long root_gpa,
 		ptdev->pgt = pkvm_get_host_iommu_spgt(root_gpa, ptdev->iommu_coherency);
 		PKVM_ASSERT(ptdev->pgt);
 	}
-out:
-	pkvm_spin_unlock(&ptdev->lock);
 }
 
+/* Assumes ptdev->lock to be held */
 void pkvm_setup_ptdev_did(struct pkvm_ptdev *ptdev, u16 did)
 {
 	ptdev->did = did;
