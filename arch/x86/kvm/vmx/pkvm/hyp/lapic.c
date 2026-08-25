@@ -67,9 +67,9 @@ static void __pkvm_lapic_icr_write(struct pkvm_lapic *lapic, u32 low, u32 id)
 		pkvm_wrmsrl(APIC_BASE_MSR + (APIC_ICR >> 4),
 			    low | ((u64)id << 32));
 	else {
+		__pkvm_wait_icr_idle(lapic);
 		writel(id, lapic->apic_base_va + APIC_ICR2);
 		writel(low, lapic->apic_base_va + APIC_ICR);
-		__pkvm_wait_icr_idle(lapic);
 	}
 }
 
