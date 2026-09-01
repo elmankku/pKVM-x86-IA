@@ -70,6 +70,12 @@ static int icl_nhi_force_power(struct tb_nhi *nhi, bool power)
 			usleep_range(3000, 3100);
 		} while (--retries);
 
+		dev_err(&nhi->pdev->dev,
+			"failed to enable Force Power, VS_CAP_9=0x%08x\n", val);
+
+		vs_cap &= ~VS_CAP_22_FORCE_POWER;
+		pci_write_config_dword(nhi->pdev, VS_CAP_22, vs_cap);
+
 		return -ETIMEDOUT;
 	}
 
