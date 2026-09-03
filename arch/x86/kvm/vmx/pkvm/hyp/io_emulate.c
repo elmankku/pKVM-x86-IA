@@ -219,9 +219,10 @@ static int mmio_instruction_decode(struct kvm_vcpu *vcpu, unsigned long gpa,
 {
 	struct x86_exception exception;
 	bool direction, zero_extend = false;
+	bool byte_reg = false, operand_size = false;
 	unsigned long rip;
-	u8 insn[3];
-	int size;
+	u8 insn[4], opcode, rex = 0;
+	int index = 0, reg, size;
 
 	rip = vmcs_readl(GUEST_RIP);
 
@@ -232,20 +233,25 @@ static int mmio_instruction_decode(struct kvm_vcpu *vcpu, unsigned long gpa,
 	if (read_gva(vcpu, rip, insn, 3, &exception) < 0)
 		return -EINVAL;
 
-	/*
-	 * In case the compiler adds the REX prefix
-	 */
-	if ((insn[0] & 0xf0) == 0x40) {
-		insn[0] = insn[1];
-		insn[1] = insn[2];
+	/* Optional operand-size prefix: switches operand size to 16bit in 32bit/64bit
+	 * mode and to 32bit in 16bit mode. */
+	if (insn[index] == 0x66) {
+		operand_size = true;
+		index++;
 	}
 
-	if (insn[0] == 0x66 && (insn[1] & 0xf0) == 0x40)
-		insn[1] = insn[2];
+	/* Optional REX prefix always immediately precedes opcode byte. REX.W indicates 64bit operand size. */
+	if ((insn[index] & 0xf0) == 0x40)
+		rex = insn[index++];
 
-	switch (insn[0]) {
+	opcode = insn[index++];
+	switch (opcode) {
 	case 0x0f:
-		switch (insn[1]) {
+		/* Legacy operand-size is invalid here */
+		if (operand_size)
+			return -EIO;
+
+		switch (insn[index++]) {
 		case 0xb6:
 			zero_extend = true;
 			direction = PKVM_IO_READ;
@@ -255,45 +261,55 @@ static int mmio_instruction_decode(struct kvm_vcpu *vcpu, unsigned long gpa,
 			return -EIO;
 		}
 		break;
-	case 0x66:
-		size = 2;
-		switch (insn[1]) {
-		case 0x89:
-			direction = PKVM_IO_WRITE;
-			break;
-		case 0x8b:
-			direction = PKVM_IO_READ;
-			break;
-		default:
-			return -EIO;
-		}
-		break;
 	case 0x88:
 		size = 1;
+		byte_reg = true;
 		direction = PKVM_IO_WRITE;
 		break;
 	case 0x89:
-		size = 4;
+		/* REX.W indicates 64-bit access. Unsupported. */
+		if (rex & 0x08)
+			return -EIO;
+		size = operand_size ? 2 : 4;
 		direction = PKVM_IO_WRITE;
 		break;
 	case 0x8a:
 		size = 1;
+		byte_reg = true;
 		direction = PKVM_IO_READ;
 		break;
 	case 0x8b:
-		size = 4;
+		/* REX.W indicates 64-bit access. Unsupported. */
+		if (rex & 0x08)
+			return -EIO;
+		size = operand_size ? 2 : 4;
 		direction = PKVM_IO_READ;
 		break;
 	default:
 		return -EIO;
 	}
 
+	if (index == 3 &&
+	    read_gva(vcpu, rip + index, &insn[index], 1, &exception) < 0)
+		return -EINVAL;
+
+	/* The faulting operand must be memory, not another register. */
+	if ((insn[index] & 0xc0) == 0xc0)
+		return -EIO;
+
+	reg = (insn[index] >> 3) & 0x7;
+	reg |= (rex & 0x04) << 1;
+
+	/* AH, CH, DH and BH need special handling which is not implemented. */
+	if (byte_reg && !rex && reg >= VCPU_REGS_RSP)
+		return -EIO;
+
 	req->address = gpa;
 	req->size = size;
-	req->value = &vcpu->arch.regs[VCPU_REGS_RAX];
+	req->value = &vcpu->arch.regs[reg];
 	req->direction = direction;
 
-	if (zero_extend)
+	if (direction == PKVM_IO_READ && (zero_extend || size == 4))
 		*req->value = 0;
 
 	return 0;
