@@ -29,6 +29,7 @@
 #include <trace/events/power.h>
 #include <linux/hw_breakpoint.h>
 #include <linux/entry-common.h>
+#include <asm/coco.h>
 #include <asm/cpu.h>
 #include <asm/cpuid/api.h>
 #include <asm/apic.h>
@@ -970,6 +971,9 @@ void amd_e400_c1e_apic_setup(void)
 void __init arch_post_acpi_subsys_init(void)
 {
 	u32 lo, hi;
+
+	if (!acpi_disabled)
+		cc_platform_acpi_init();
 
 	if (!boot_cpu_has_bug(X86_BUG_AMD_E400))
 		return;

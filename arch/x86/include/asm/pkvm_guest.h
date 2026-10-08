@@ -29,4 +29,12 @@ static inline bool pkvm_is_protected_guest(void) { return false; }
 
 #endif /* CONFIG_PKVM_X86_GUEST */
 
+#if defined(CONFIG_PKVM_X86_GUEST) && defined(CONFIG_ACPI)
+void pkvm_acpi_init(void);
+#else
+static inline void pkvm_acpi_init(void)
+{
+}
+#endif
+
 #endif /* _ASM_X86_PKVM_GUEST_H */

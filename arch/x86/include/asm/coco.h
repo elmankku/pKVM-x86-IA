@@ -48,4 +48,12 @@ static inline u64 cc_mkdec(u64 val)
 static inline void cc_random_init(void) { }
 #endif
 
+#if defined(CONFIG_ARCH_HAS_CC_PLATFORM) && defined(CONFIG_ACPI)
+void cc_platform_acpi_init(void);
+#else
+static inline void cc_platform_acpi_init(void)
+{
+}
+#endif
+
 #endif /* _ASM_X86_COCO_H */

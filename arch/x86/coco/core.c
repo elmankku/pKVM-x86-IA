@@ -15,12 +15,26 @@
 
 #include <asm/archrandom.h>
 #include <asm/coco.h>
+#include <asm/pkvm_guest.h>
 #include <asm/processor.h>
 
 enum cc_vendor cc_vendor __ro_after_init = CC_VENDOR_NONE;
 SYM_PIC_ALIAS(cc_vendor);
 u64 cc_mask __ro_after_init;
 SYM_PIC_ALIAS(cc_mask);
+
+#ifdef CONFIG_ACPI
+void __init cc_platform_acpi_init(void)
+{
+	switch (cc_vendor) {
+	case CC_VENDOR_PKVM:
+		pkvm_acpi_init();
+		break;
+	default:
+		break;
+	}
+}
+#endif
 
 static struct cc_attr_flags {
 	__u64 host_sev_snp	: 1,
