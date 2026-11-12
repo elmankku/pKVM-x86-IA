@@ -192,7 +192,7 @@ static int initialize_qi(struct intel_iommu *iommu)
 	 * Set DW=1 and QS=1 in IQA_REG when Scalable Mode capability
 	 * is present.
 	 */
-	if (sm_supported(iommu))
+	if (ecap_smts(iommu->ecap))
 		val |= BIT_ULL(11) | BIT_ULL(0);
 
 	/* write zero to the tail reg */
