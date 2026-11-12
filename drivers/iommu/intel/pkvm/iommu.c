@@ -594,9 +594,10 @@ int pkvm_iommu_mmio_write(u64 phys, int len, u64 val)
 				"iommu%d: RTA translation mode conflicts with policy!\n",
 				iommu->seq_id);
 			ret = -EINVAL;
-		} else if (iommu->vgsts & DMA_GSTS_TES) {
-			pkvm_err("iommu%d: Setting RTA after Translation enabled!\n",
-				 iommu->seq_id);
+		} else if (iommu->root_entry || (iommu->vgsts & DMA_GSTS_TES)) {
+			pkvm_err(
+				"iommu%d: Setting RTA after root table setup!\n",
+				iommu->seq_id);
 			ret = -EBUSY;
 		} else {
 			iommu->vrta = val;
