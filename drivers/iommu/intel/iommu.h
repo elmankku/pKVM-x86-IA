@@ -340,6 +340,7 @@
 #define DMA_GSTS_CFIS (((u32)1) << 23)
 
 /* DMA_RTADDR_REG */
+#define DMA_RTADDR_TTM_MASK GENMASK_ULL(11, 10)
 #define DMA_RTADDR_SMT (((u64)1) << 10)
 
 /* CCMD_REG */

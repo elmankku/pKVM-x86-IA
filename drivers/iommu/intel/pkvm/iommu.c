@@ -588,9 +588,11 @@ int pkvm_iommu_mmio_write(u64 phys, int len, u64 val)
 		}
 		break;
 	case DMAR_RTADDR_REG:
-		if (sm_supported(iommu) && !(val & DMA_RTADDR_SMT)) {
-			pkvm_err("iommu%d: SM enabled but not set in RTA!\n",
-				 iommu->seq_id);
+		if ((val & DMA_RTADDR_TTM_MASK) !=
+		    (sm_supported(iommu) ? DMA_RTADDR_SMT : 0)) {
+			pkvm_err(
+				"iommu%d: RTA translation mode conflicts with policy!\n",
+				iommu->seq_id);
 			ret = -EINVAL;
 		} else if (iommu->vgsts & DMA_GSTS_TES) {
 			pkvm_err("iommu%d: Setting RTA after Translation enabled!\n",
