@@ -111,3 +111,7 @@ int intel_fbdev_fb_fill_info(struct intel_display *display, struct fb_info *info
 
 	return 0;
 }
+
+void intel_fbdev_fb_unmap(struct drm_gem_object *obj)
+{
+}

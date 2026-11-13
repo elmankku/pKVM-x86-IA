@@ -18,4 +18,6 @@ struct intel_framebuffer *intel_fbdev_fb_alloc(struct drm_fb_helper *helper,
 int intel_fbdev_fb_fill_info(struct intel_display *display, struct fb_info *info,
 			     struct drm_gem_object *obj, struct i915_vma *vma);
 
+void intel_fbdev_fb_unmap(struct drm_gem_object *obj);
+
 #endif

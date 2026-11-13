@@ -62,6 +62,7 @@ struct intel_fbdev {
 	struct intel_framebuffer *fb;
 	struct i915_vma *vma;
 	unsigned long vma_flags;
+	void *sysmem_map;
 };
 
 static struct intel_fbdev *to_intel_fbdev(struct drm_fb_helper *fb_helper)
@@ -84,6 +85,10 @@ static void intel_fbdev_invalidate(struct intel_fbdev *ifbdev)
 FB_GEN_DEFAULT_DEFERRED_IOMEM_OPS(intel_fbdev,
 				  drm_fb_helper_damage_range,
 				  drm_fb_helper_damage_area)
+
+FB_GEN_DEFAULT_DEFERRED_SYSMEM_OPS(intel_fbdev_sysmem,
+				   drm_fb_helper_damage_range,
+				   drm_fb_helper_damage_area)
 
 static int intel_fbdev_set_par(struct fb_info *info)
 {
@@ -142,6 +147,8 @@ static void intel_fbdev_fb_destroy(struct fb_info *info)
 	 * the info->screen_base mmaping. Leaking the VMA is simpler than
 	 * trying to rectify all the possible error paths leading here.
 	 */
+	if (ifbdev->sysmem_map)
+		intel_fbdev_fb_unmap(intel_fb_bo(fb_helper->fb));
 	intel_fb_unpin_vma(ifbdev->vma, ifbdev->vma_flags);
 	drm_framebuffer_remove(fb_helper->fb);
 
@@ -161,6 +168,18 @@ static const struct fb_ops intelfb_ops = {
 	.fb_blank = intel_fbdev_blank,
 	.fb_pan_display = intel_fbdev_pan_display,
 	__FB_DEFAULT_DEFERRED_OPS_DRAW(intel_fbdev),
+	.fb_mmap = intel_fbdev_mmap,
+	.fb_destroy = intel_fbdev_fb_destroy,
+};
+
+static const struct fb_ops intelfb_sysmem_ops = {
+	.owner = THIS_MODULE,
+	__FB_DEFAULT_DEFERRED_OPS_RDWR(intel_fbdev_sysmem),
+	DRM_FB_HELPER_DEFAULT_OPS,
+	.fb_set_par = intel_fbdev_set_par,
+	.fb_blank = intel_fbdev_blank,
+	.fb_pan_display = intel_fbdev_pan_display,
+	__FB_DEFAULT_DEFERRED_OPS_DRAW(intel_fbdev_sysmem),
 	.fb_mmap = intel_fbdev_mmap,
 	.fb_destroy = intel_fbdev_fb_destroy,
 };
@@ -280,6 +299,11 @@ int intel_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
 	ret = intel_fbdev_fb_fill_info(display, info, obj, vma);
 	if (ret)
 		goto out_unpin;
+
+	if (info->flags & FBINFO_VIRTFB) {
+		info->fbops = &intelfb_sysmem_ops;
+		ifbdev->sysmem_map = info->screen_buffer;
+	}
 
 	drm_fb_helper_fill_info(info, display->drm->fb_helper, sizes);
 
@@ -515,5 +539,8 @@ struct i915_vma *intel_fbdev_vma_pointer(struct intel_fbdev *fbdev)
 
 void intel_fbdev_get_map(struct intel_fbdev *fbdev, struct iosys_map *map)
 {
-	intel_fb_get_map(fbdev->vma, map);
+	if (fbdev->sysmem_map)
+		iosys_map_set_vaddr(map, fbdev->sysmem_map);
+	else
+		intel_fb_get_map(fbdev->vma, map);
 }

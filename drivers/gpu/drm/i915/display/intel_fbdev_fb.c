@@ -5,7 +5,12 @@
 
 #include <drm/drm_fb_helper.h>
 
+#ifdef CONFIG_PKVM_X86_GUEST
+#include <asm/pkvm_guest.h>
+#endif
+
 #include "gem/i915_gem_lmem.h"
+#include "gem/i915_gem_object.h"
 
 #include "i915_drv.h"
 #include "intel_display_core.h"
@@ -79,7 +84,12 @@ int intel_fbdev_fb_fill_info(struct intel_display *display, struct fb_info *info
 	struct drm_i915_gem_object *obj = to_intel_bo(_obj);
 	struct i915_gem_ww_ctx ww;
 	void __iomem *vaddr;
+	bool use_sysmem = false;
 	int ret;
+
+#ifdef CONFIG_PKVM_X86_GUEST
+	use_sysmem = pkvm_is_protected_guest() && i915_gem_object_is_shmem(obj);
+#endif
 
 	if (i915_gem_object_is_lmem(obj)) {
 		struct intel_memory_region *mem = obj->mm.region;
@@ -105,7 +115,11 @@ int intel_fbdev_fb_fill_info(struct intel_display *display, struct fb_info *info
 		if (ret)
 			continue;
 
-		vaddr = i915_vma_pin_iomap(vma);
+		if (use_sysmem)
+			vaddr = (void __force __iomem *)
+				i915_gem_object_pin_map(obj, I915_MAP_WC);
+		else
+			vaddr = i915_vma_pin_iomap(vma);
 		if (IS_ERR(vaddr)) {
 			drm_err(display->drm,
 				"Failed to remap framebuffer into virtual memory (%pe)\n", vaddr);
@@ -117,8 +131,18 @@ int intel_fbdev_fb_fill_info(struct intel_display *display, struct fb_info *info
 	if (ret)
 		return ret;
 
-	info->screen_base = vaddr;
+	if (use_sysmem) {
+		info->flags |= FBINFO_VIRTFB;
+		info->screen_buffer = (void __force *)vaddr;
+	} else {
+		info->screen_base = vaddr;
+	}
 	info->screen_size = intel_bo_to_drm_bo(obj)->size;
 
 	return 0;
+}
+
+void intel_fbdev_fb_unmap(struct drm_gem_object *obj)
+{
+	i915_gem_object_unpin_map(to_intel_bo(obj));
 }
