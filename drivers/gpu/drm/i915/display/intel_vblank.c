@@ -5,6 +5,10 @@
 
 #include <linux/iopoll.h>
 
+#ifdef CONFIG_PKVM_X86_GUEST
+#include <asm/pkvm_guest.h>
+#endif
+
 #include <drm/drm_vblank.h>
 
 #include "i915_drv.h"
@@ -659,6 +663,7 @@ void intel_vblank_evade_init(const struct intel_crtc_state *old_crtc_state,
 	const struct intel_crtc_state *crtc_state;
 	const struct drm_display_mode *adjusted_mode;
 	int vblank_delay;
+	int evasion_us = VBLANK_EVASION_TIME_US;
 
 	evade->crtc = crtc;
 
@@ -688,9 +693,15 @@ void intel_vblank_evade_init(const struct intel_crtc_state *old_crtc_state,
 		vblank_delay = intel_mode_vblank_delay(adjusted_mode);
 	}
 
+#ifdef CONFIG_PKVM_X86_GUEST
+	/* Trapped display MMIO needs a larger pre-vblank update margin. */
+	if (pkvm_is_protected_guest())
+		evasion_us = 3000;
+#endif
+
 	/* FIXME needs to be calibrated sensibly */
 	evade->min = evade->vblank_start - intel_usecs_to_scanlines(adjusted_mode,
-								    VBLANK_EVASION_TIME_US);
+								    evasion_us);
 	evade->max = evade->vblank_start - 1;
 
 	/*
@@ -715,6 +726,11 @@ int intel_vblank_evade(struct intel_vblank_evade_ctx *evade)
 	wait_queue_head_t *wq = drm_crtc_vblank_waitqueue(&crtc->base);
 	DEFINE_WAIT(wait);
 	int scanline;
+
+#ifdef CONFIG_PKVM_X86_GUEST
+	if (pkvm_is_protected_guest())
+		timeout = msecs_to_jiffies_timeout(4);
+#endif
 
 	if (evade->min <= 0 || evade->max <= 0)
 		return 0;
