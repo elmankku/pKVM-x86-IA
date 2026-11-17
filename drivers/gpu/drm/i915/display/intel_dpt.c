@@ -9,6 +9,10 @@
 #include "gt/gen8_ppgtt.h"
 
 #include "i915_drv.h"
+
+#ifdef CONFIG_PKVM_X86_GUEST
+#include <asm/pkvm_guest.h>
+#endif
 #include "intel_display_core.h"
 #include "intel_display_rpm.h"
 #include "intel_display_types.h"
@@ -21,6 +25,7 @@ struct i915_dpt {
 	struct drm_i915_gem_object *obj;
 	struct i915_vma *vma;
 	void __iomem *iomem;
+	gen8_pte_t *sysmem;
 };
 
 #define i915_is_dpt(vm) ((vm)->is_dpt)
@@ -33,9 +38,12 @@ i915_vm_to_dpt(struct i915_address_space *vm)
 	return container_of(vm, struct i915_dpt, vm);
 }
 
-static void gen8_set_pte(void __iomem *addr, gen8_pte_t pte)
+static void dpt_set_pte(struct i915_dpt *dpt, unsigned int index, gen8_pte_t pte)
 {
-	writeq(pte, addr);
+	if (dpt->sysmem)
+		dpt->sysmem[index] = pte;
+	else
+		writeq(pte, dpt->iomem + index * sizeof(pte));
 }
 
 static void dpt_insert_page(struct i915_address_space *vm,
@@ -45,10 +53,11 @@ static void dpt_insert_page(struct i915_address_space *vm,
 			    u32 flags)
 {
 	struct i915_dpt *dpt = i915_vm_to_dpt(vm);
-	gen8_pte_t __iomem *base = dpt->iomem;
 
-	gen8_set_pte(base + offset / I915_GTT_PAGE_SIZE,
-		     vm->pte_encode(addr, pat_index, flags));
+	dpt_set_pte(dpt, offset / I915_GTT_PAGE_SIZE,
+		    vm->pte_encode(addr, pat_index, flags));
+	if (dpt->sysmem)
+		i915_gem_object_flush_map(dpt->obj);
 }
 
 static void dpt_insert_entries(struct i915_address_space *vm,
@@ -57,7 +66,6 @@ static void dpt_insert_entries(struct i915_address_space *vm,
 			       u32 flags)
 {
 	struct i915_dpt *dpt = i915_vm_to_dpt(vm);
-	gen8_pte_t __iomem *base = dpt->iomem;
 	const gen8_pte_t pte_encode = vm->pte_encode(0, pat_index, flags);
 	struct sgt_iter sgt_iter;
 	dma_addr_t addr;
@@ -70,7 +78,9 @@ static void dpt_insert_entries(struct i915_address_space *vm,
 
 	i = vma_res->start / I915_GTT_PAGE_SIZE;
 	for_each_sgt_daddr(addr, sgt_iter, vma_res->bi.pages)
-		gen8_set_pte(&base[i++], pte_encode | addr);
+		dpt_set_pte(dpt, i++, pte_encode | addr);
+	if (dpt->sysmem)
+		i915_gem_object_flush_map(dpt->obj);
 }
 
 static void dpt_clear_range(struct i915_address_space *vm,
@@ -132,7 +142,12 @@ struct i915_vma *intel_dpt_pin_to_ggtt(struct i915_address_space *vm,
 	void __iomem *iomem;
 	struct i915_gem_ww_ctx ww;
 	u64 pin_flags = 0;
+	bool use_sysmem = false;
 	int err;
+
+#ifdef CONFIG_PKVM_X86_GUEST
+	use_sysmem = pkvm_is_protected_guest() && i915_gem_object_is_shmem(dpt->obj);
+#endif
 
 	if (i915_gem_object_is_stolen(dpt->obj))
 		pin_flags |= PIN_MAPPABLE;
@@ -149,6 +164,21 @@ struct i915_vma *intel_dpt_pin_to_ggtt(struct i915_address_space *vm,
 						  alignment, pin_flags);
 		if (IS_ERR(vma)) {
 			err = PTR_ERR(vma);
+			continue;
+		}
+
+		if (use_sysmem) {
+			void *map = i915_gem_object_pin_map(dpt->obj, I915_MAP_WC);
+
+			if (IS_ERR(map)) {
+				err = PTR_ERR(map);
+				i915_vma_unpin(vma);
+				continue;
+			}
+
+			/* Retain the GGTT pin while the DPT is used for scanout. */
+			dpt->sysmem = map;
+			dpt->vma = i915_vma_get(vma);
 			continue;
 		}
 
@@ -178,7 +208,12 @@ void intel_dpt_unpin_from_ggtt(struct i915_address_space *vm)
 {
 	struct i915_dpt *dpt = i915_vm_to_dpt(vm);
 
-	i915_vma_unpin_iomap(dpt->vma);
+	if (dpt->sysmem) {
+		i915_gem_object_unpin_map(dpt->obj);
+		i915_vma_unpin(dpt->vma);
+	} else {
+		i915_vma_unpin_iomap(dpt->vma);
+	}
 	i915_vma_put(dpt->vma);
 }
 
