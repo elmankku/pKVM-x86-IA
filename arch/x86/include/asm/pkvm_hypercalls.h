@@ -110,6 +110,10 @@ PKVM_HC(iommu_alloc_did)
 PKVM_HC(iommu_free_did)
 #endif
 
+/* device hypercalls */
+PKVM_HC(vm_assign_device)
+PKVM_HC(vm_reclaim_device)
+
 #undef PKVM_HC
 #undef PKVM_HC_OUT
 #undef PKVM_HC_IN

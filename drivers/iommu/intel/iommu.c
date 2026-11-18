@@ -1696,6 +1696,26 @@ static void context_present_cache_flush(struct intel_iommu *iommu, u16 did,
 	}
 }
 
+static void domain_context_set(struct dmar_domain *domain,
+			       struct intel_iommu *iommu,
+			       struct device_domain_info *info,
+			       struct context_entry *context, u16 did,
+			       u8 bus, u8 devfn)
+{
+	int translation = info && info->ats_supported ?
+		CONTEXT_TT_DEV_IOTLB : CONTEXT_TT_MULTI_LEVEL;
+
+	context_clear_entry(context);
+	context_set_domain_id(context, did);
+	context_set_address_root(context, virt_to_phys(domain->pgd));
+	context_set_address_width(context, domain->agaw);
+	context_set_translation_type(context, translation);
+	context_set_fault_enable(context);
+	context_set_present(context);
+	__iommu_flush_cache(iommu, context, sizeof(*context));
+	context_present_cache_flush(iommu, did, bus, devfn);
+}
+
 int domain_context_mapping_one(struct dmar_domain *domain,
 			       struct intel_iommu *iommu,
 #ifdef __PKVM_HYP__
@@ -1711,8 +1731,6 @@ int domain_context_mapping_one(struct dmar_domain *domain,
 #else
 	struct pkvm_device dev = { .info = info };
 #endif
-	int translation = CONTEXT_TT_MULTI_LEVEL;
-	struct dma_pte *pgd = domain->pgd;
 	struct context_entry *context;
 	int ret;
 
@@ -1762,22 +1780,7 @@ int domain_context_mapping_one(struct dmar_domain *domain,
 	if (ret)
 		goto out_unlock;
 #endif
-	context_clear_entry(context);
-	context_set_domain_id(context, did);
-
-	if (info && info->ats_supported)
-		translation = CONTEXT_TT_DEV_IOTLB;
-	else
-		translation = CONTEXT_TT_MULTI_LEVEL;
-
-	context_set_address_root(context, virt_to_phys(pgd));
-	context_set_address_width(context, domain->agaw);
-	context_set_translation_type(context, translation);
-	context_set_fault_enable(context);
-	context_set_present(context);
-	if (!ecap_coherent(iommu->ecap))
-		clflush_cache_range(context, sizeof(*context));
-	context_present_cache_flush(iommu, did, bus, devfn);
+	domain_context_set(domain, iommu, info, context, did, bus, devfn);
 	ret = 0;
 
 out_unlock:
@@ -1785,6 +1788,70 @@ out_unlock:
 
 	return ret;
 }
+
+#ifdef __PKVM_HYP__
+/*
+ * Replace an existing non-ATS host binding. Caller holds devices_lock and a
+ * reference to @domain which becomes the new hardware binding's reference.
+ * On failure, the old binding and the caller's reference are unchanged.
+ */
+int pkvm_iommu_replace_lm_context(struct dmar_domain *domain,
+				  struct intel_iommu *iommu, u16 did, u16 bdf)
+{
+	struct device_domain_info info = {
+		.iommu = iommu, .bus = PCI_BUS_NUM(bdf), .devfn = bdf & 0xff,
+	};
+	struct pkvm_device dev = { .info = &info };
+	struct context_entry *context;
+	struct dmar_domain *old;
+	u16 old_did;
+	int ret = -EINVAL;
+
+	if (sm_supported(iommu))
+		return -EOPNOTSUPP;
+
+	spin_lock(&iommu->lock);
+	ret = -ENODEV;
+	if (!iommu->qi || !(iommu->vgsts & DMA_GSTS_TES))
+		goto unlock;
+	ret = -EINVAL;
+	if (!domain->owner_vm ||
+	    !pkvm_iommu_is_valid_did_locked(iommu, domain, did))
+		goto unlock;
+
+	/* The host must have established a context before VM assignment. */
+	ret = -ENODEV;
+	context = iommu_context_addr(iommu, info.bus, info.devfn, 0);
+	if (!context || !context_present(context))
+		goto unlock;
+	ret = -EOPNOTSUPP;
+	if ((context->lo & GENMASK_ULL(3, 2)) !=
+	    (CONTEXT_TT_MULTI_LEVEL << 2))
+		goto unlock;
+
+	old_did = context_domain_id(context);
+	old = pkvm_get_iommu_domain_noref(phys_to_virt(context->lo & VTD_PAGE_MASK),
+					old_did);
+	ret = -EBUSY;
+	if (old->owner_vm)
+		goto unlock;
+
+	/* Reserve the only fallible resource before changing the old entry. */
+	ret = cache_tag_assign_domain(domain, did, &dev, IOMMU_NO_PASID);
+	if (ret)
+		goto unlock;
+
+	context_clear_present(context);
+	__iommu_flush_cache(iommu, context, sizeof(*context));
+	intel_context_flush_no_pasid(&info, context, old_did);
+	cache_tag_unassign_domain(old, old_did, &dev, IOMMU_NO_PASID);
+	domain_context_set(domain, iommu, &info, context, did, info.bus, info.devfn);
+	pkvm_put_iommu_domain(old);
+unlock:
+	spin_unlock(&iommu->lock);
+	return ret;
+}
+#endif
 
 #ifndef __PKVM_HYP__
 static int domain_context_mapping_cb(struct pci_dev *pdev,

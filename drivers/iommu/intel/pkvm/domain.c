@@ -515,6 +515,118 @@ int pkvm_iommu_domain_alloc_did(u64 phys, u64 pgd_gpa)
 	return ret;
 }
 
+/* Caller holds a VM reference throughout acquisition or release. */
+static struct dmar_domain *get_guest_iommu_domain(struct pkvm_vm *vm)
+{
+	struct dmar_domain *domain;
+
+	if (!pkvm_is_protected_vm(&vm->kvm))
+		return ERR_PTR(-EPERM);
+	if (!vm->dma_domain)
+		return ERR_PTR(-ENODEV);
+
+	domain = __pkvm_get_iommu_domain(vm->dma_domain->pgd);
+	if (!domain)
+		return ERR_PTR(-ENODEV);
+	if (domain->owner_vm != vm) {
+		pkvm_put_iommu_domain(domain);
+		return ERR_PTR(-EPERM);
+	}
+	return domain;
+}
+
+/* Caller holds devices_lock across attachment and assignment publication. */
+int pkvm_guest_iommu_attach_device(struct pkvm_vm *vm,
+				   struct intel_iommu *iommu, u16 did, u16 bdf)
+{
+	struct dmar_domain *domain = get_guest_iommu_domain(vm);
+	int ret;
+
+	if (IS_ERR(domain))
+		return PTR_ERR(domain);
+
+	pkvm_spin_lock(&domain->lock);
+	if (!iommu_domain_compatible(iommu, domain))
+		ret = -EINVAL;
+	else
+		ret = pkvm_iommu_replace_lm_context(domain, iommu, did, bdf);
+	pkvm_spin_unlock(&domain->lock);
+	if (ret)
+		pkvm_put_iommu_domain(domain);
+	/* Success transfers this reference to the hardware binding. */
+	return ret;
+}
+
+/* Caller holds devices_lock; host context changes cannot race this sequence. */
+int pkvm_guest_iommu_detach_device(struct pkvm_vm *vm,
+				   struct intel_iommu *iommu, u16 did, u16 bdf)
+{
+	struct device_domain_info info = {
+		.iommu = iommu, .bus = PCI_BUS_NUM(bdf), .devfn = bdf & 0xff,
+	};
+	struct dmar_domain *domain = get_guest_iommu_domain(vm);
+	struct dmar_domain *binding;
+	struct context_entry *context;
+	int ret = 0;
+
+	if (IS_ERR(domain))
+		return PTR_ERR(domain);
+	if (sm_supported(iommu)) {
+		ret = -EOPNOTSUPP;
+		goto put_domain;
+	}
+
+	pkvm_spin_lock(&domain->lock);
+	pkvm_spin_lock(&iommu->lock);
+	context = iommu_context_addr(iommu, info.bus, info.devfn, 0);
+	/* Allow a teardown retry after the context was already cleared. */
+	if (context && context_present(context) &&
+	    (context_domain_id(context) != did ||
+	     (context->lo & VTD_PAGE_MASK) != __pkvm_pa(domain->pgd)))
+		ret = -EPERM;
+	pkvm_spin_unlock(&iommu->lock);
+
+	if (!ret) {
+		domain_context_clear_one(&info, info.bus, info.devfn, &binding);
+		if (binding)
+			pkvm_put_iommu_domain(binding);
+	}
+	pkvm_spin_unlock(&domain->lock);
+put_domain:
+	pkvm_put_iommu_domain(domain);
+	return ret;
+}
+
+/* Reserve one device's use of a DID; this does not program hardware. */
+int pkvm_guest_iommu_get_did(struct pkvm_vm *vm, struct intel_iommu *iommu)
+{
+	struct dmar_domain *domain = get_guest_iommu_domain(vm);
+	int ret;
+
+	if (IS_ERR(domain))
+		return PTR_ERR(domain);
+
+	ret = pkvm_iommu_get_did(iommu, domain);
+	if (ret < 0)
+		pkvm_put_iommu_domain(domain);
+	return ret;
+}
+
+int pkvm_guest_iommu_put_did(struct pkvm_vm *vm, struct intel_iommu *iommu,
+			   u16 did)
+{
+	struct dmar_domain *domain = get_guest_iommu_domain(vm);
+	int ret;
+
+	if (IS_ERR(domain))
+		return PTR_ERR(domain);
+
+	ret = pkvm_iommu_free_did(iommu, domain, did);
+	pkvm_put_iommu_domain(domain);
+	/* Other devices may still hold this DID; releasing our use succeeded. */
+	return ret < 0 ? ret : 0;
+}
+
 /*
  * Caller holds a VM reference. Configure the format once; later assignments
  * must fit that format. This does not allocate a DID or program device entries.

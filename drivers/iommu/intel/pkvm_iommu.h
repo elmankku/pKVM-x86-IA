@@ -239,6 +239,17 @@ bool pkvm_iommu_is_valid_did(struct intel_iommu *iommu,
 bool pkvm_iommu_is_valid_did_locked(struct intel_iommu *iommu,
 				    struct dmar_domain *domain, u16 did);
 
+/* Caller serializes context updates with devices_lock. */
+int pkvm_iommu_replace_lm_context(struct dmar_domain *domain,
+				  struct intel_iommu *iommu, u16 did, u16 bdf);
+int pkvm_guest_iommu_attach_device(struct pkvm_vm *vm,
+				   struct intel_iommu *iommu, u16 did, u16 bdf);
+int pkvm_guest_iommu_detach_device(struct pkvm_vm *vm,
+				   struct intel_iommu *iommu, u16 did, u16 bdf);
+
+int pkvm_guest_iommu_get_did(struct pkvm_vm *vm, struct intel_iommu *iommu);
+int pkvm_guest_iommu_put_did(struct pkvm_vm *vm, struct intel_iommu *iommu,
+			   u16 did);
 int pkvm_guest_iommu_configure_domain(struct pkvm_vm *vm,
 				    struct intel_iommu *iommu);
 int pkvm_guest_iommu_init_domain(struct pkvm_vm *vm, phys_addr_t pgd_pa);

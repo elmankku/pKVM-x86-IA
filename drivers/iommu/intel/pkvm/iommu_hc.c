@@ -11,6 +11,7 @@
 #include "pkvm/memory.h"
 #include "pkvm/pkvm.h"
 #include "pkvm/debug.h"
+#include "pkvm/device.h"
 #include "../iommu.h"
 #include "../pasid.h"
 
@@ -34,6 +35,7 @@ int pkvm_iommu_clear_ce(struct clear_ce_data *data)
 	struct intel_iommu *iommu = iommu_from_phys(data->phys);
 	struct device_domain_info info = { 0 };
 	struct dmar_domain *domain;
+	int ret;
 
 	if (!iommu)
 		return -EINVAL;
@@ -48,9 +50,13 @@ int pkvm_iommu_clear_ce(struct clear_ce_data *data)
 
 	pkvm_dbg("%s: dev[%x:%x], ats_qdep: %d\n",
 		 __func__, data->bus, data->devfn, data->ats_qdep);
+	ret = pkvm_device_host_access_begin(PCI_DEVID(data->bus, data->devfn));
+	if (ret)
+		return ret;
 	domain_context_clear_one(&info, data->bus, data->devfn, &domain);
 	if (domain)
 		pkvm_put_iommu_domain(domain);
+	pkvm_device_host_access_end();
 
 	return 0;
 }
@@ -144,8 +150,13 @@ static int iommu_set_lm_ce(struct set_lm_ce_data *data)
 
 int pkvm_iommu_set_lm_ce(struct set_lm_ce_data *in, struct set_lm_ce_data *out)
 {
-	int ret = iommu_set_lm_ce(in);
+	int ret;
 
+	ret = pkvm_device_host_access_begin(PCI_DEVID(in->bus, in->devfn));
+	if (!ret) {
+		ret = iommu_set_lm_ce(in);
+		pkvm_device_host_access_end();
+	}
 	*out = *in;
 	return ret;
 }

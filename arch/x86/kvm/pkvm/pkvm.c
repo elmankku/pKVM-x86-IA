@@ -15,6 +15,7 @@
 #include "../x86.h"
 #include "../lapic.h"
 #include "pkvm_iommu.h"
+#include "device.h"
 
 /*
  * Needed by kvm_spurious_fault() which is a generic fault function for the
@@ -229,10 +230,18 @@ static void teardown_donated_memory(struct pkvm_memcache *mc, void *addr, size_t
 
 static int pkvm_vm_destroy(int vm_handle, struct pkvm_memcache *mc)
 {
-	struct pkvm_vm *pkvm_vm = free_pkvm_vm_handle(vm_handle);
+	struct pkvm_vm *pkvm_vm;
 	unsigned long shared_kvm_pa;
 	int i;
+	int ret;
 
+	ret = pkvm_teardown_devices(vm_handle);
+	if (ret) {
+		pkvm_err("VM%d failed to teardown devices: %d\n", vm_handle, ret);
+		return ret;
+	}
+
+	pkvm_vm = free_pkvm_vm_handle(vm_handle);
 	if (IS_ERR(pkvm_vm))
 		return PTR_ERR(pkvm_vm);
 
@@ -1886,6 +1895,22 @@ put_vm:
 	return ret;
 }
 
+static int pkvm_vm_assign_device(int vm_handle, u16 bdf, u32 group_id,
+				 u64 iommu_phys)
+{
+	pkvm_info("%s: handle=%d devid=0x%x group=%d\n", __func__, vm_handle,
+		  bdf, group_id);
+
+	return pkvm_assign_device(vm_handle, bdf, group_id, iommu_phys);
+}
+
+static int pkvm_vm_reclaim_device(int vm_handle, u16 bdf)
+{
+	pkvm_info("%s: handle=%d devid=0x%x\n", __func__, vm_handle, bdf);
+
+	return pkvm_reclaim_device(vm_handle, bdf);
+}
+
 static int pkvm_vcpu_handle_host_hypercall(struct kvm_vcpu *hvcpu, enum pkvm_hc hc,
 					   union pkvm_hc_data *in, union pkvm_hc_data *out)
 {
@@ -2235,6 +2260,16 @@ void pkvm_handle_host_hypercall(struct kvm_vcpu *vcpu)
 						 pkvm_hc_input3(vcpu));
 		break;
 #endif
+	case __pkvm__vm_assign_device:
+		ret = pkvm_vm_assign_device(pkvm_hc_input1(vcpu),
+					    pkvm_hc_input2(vcpu),
+					    pkvm_hc_input3(vcpu),
+					    pkvm_hc_input4(vcpu));
+		break;
+	case __pkvm__vm_reclaim_device:
+		ret = pkvm_vm_reclaim_device(pkvm_hc_input1(vcpu),
+					     pkvm_hc_input2(vcpu));
+		break;
 	default:
 		ret = pkvm_vcpu_handle_host_hypercall(vcpu, hc, &in, &out);
 		break;
