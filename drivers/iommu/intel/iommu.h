@@ -661,6 +661,13 @@ struct dmar_domain {
 #ifndef __PKVM_HYP__
 	int	nid;			/* node id */
 	struct xarray iommu_array;	/* Attached IOMMU array */
+#else
+	/* Attached IOMMU array.
+	 *
+	 * Indexed by iommu->seq_id and protected by iommu->lock.
+	 * A non-zero info->did means the slot is allocated for a DID.
+	 */
+	struct iommu_domain_info iommu_array[PKVM_MAX_IOMMU_NUM];
 #endif
 
 	u8 iommu_coherency: 1;		/* indicate coherency of iommu access */
@@ -902,6 +909,7 @@ struct intel_iommu {
 	struct q_inval  *qi;    /* Pointer to _qi. Enables host code re-use */
 	struct iommu_flush flush;
 	struct root_entry *root_entry;
+	struct pkvm_domain_ids domain_ids;
 	bool		pmu_supported;
 	u64		pmu_perfcap;
 	u32		pmu_cfg;

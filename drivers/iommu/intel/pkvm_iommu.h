@@ -10,6 +10,7 @@
 #include <asm/kvm_host.h>
 #include <asm/kvm_pkvm.h>
 
+#define PKVM_MAX_IOMMU_NUM	32
 #define PKVM_MAX_SATC_DEVS	16
 
 /* Page table level represented by IOMMU cap SAGAW bits */
@@ -31,6 +32,13 @@ struct intel_iommu;
 struct dmar_domain;
 struct device_domain_info;
 struct irte;
+
+#define PKVM_MAX_DIDS (1U << 16)
+
+struct pkvm_domain_ids {
+	unsigned int nr_dids;
+	DECLARE_BITMAP(used, PKVM_MAX_DIDS);
+};
 
 #ifdef CONFIG_PKVM_INTEL
 extern u16 pkvm_sym(satc_devs)[];
@@ -215,6 +223,18 @@ int pkvm_iommu_domain_map(struct domain_map_data *in, struct domain_map_data *ou
 int pkvm_iommu_domain_unmap(u64 pgd_gpa, u64 start_pfn, u64 last_pfn);
 int pkvm_iommu_domain_flush(u64 pgd_gpa, u64 start, u64 last, bool ih);
 int pkvm_iommu_modify_irte(struct modify_irte_data *data);
+int pkvm_iommu_domain_alloc_did(u64 phys, u64 pgd_gpa);
+int pkvm_iommu_domain_free_did(u64 phys, u64 pgd_gpa, u16 did);
+void pkvm_iommu_init_did(struct intel_iommu *iommu);
+/* Successful alloc/get consumes one caller-held domain reference. */
+int pkvm_iommu_alloc_did(struct intel_iommu *iommu, struct dmar_domain *domain);
+int pkvm_iommu_get_did(struct intel_iommu *iommu, struct dmar_domain *domain);
+int pkvm_iommu_free_did(struct intel_iommu *iommu, struct dmar_domain *domain, u16 did);
+bool pkvm_iommu_is_valid_did(struct intel_iommu *iommu,
+			     struct dmar_domain *domain, u16 did);
+/* Caller holds iommu->lock across validation and context publication. */
+bool pkvm_iommu_is_valid_did_locked(struct intel_iommu *iommu,
+				    struct dmar_domain *domain, u16 did);
 
 /*
  * Return value from a pKVM MMIO register validator meaning "this offset is not

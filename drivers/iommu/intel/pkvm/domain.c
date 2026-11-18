@@ -137,9 +137,10 @@ struct dmar_domain *pkvm_get_iommu_domain(void *pgd, u16 did,
 
 	domain = __pkvm_get_iommu_domain(pgd);
 
-	if (domain && !iommu_domain_compatible(iommu, domain)) {
-		pkvm_err("%s: domain[pgd:%p] is incompatible with iommu%d\n",
-			 __func__, pgd, iommu->seq_id);
+	if (domain && (!pkvm_iommu_is_valid_did(iommu, domain, did) ||
+		       !iommu_domain_compatible(iommu, domain))) {
+		pkvm_err("%s: invalid DID %u or incompatible domain[pgd:%p] for iommu%d\n",
+			 __func__, did, pgd, iommu->seq_id);
 		pkvm_put_iommu_domain(domain);
 		domain = NULL;
 	}
@@ -425,4 +426,77 @@ int pkvm_iommu_domain_flush(u64 pgd_gpa, u64 start, u64 last, bool ih)
 	pkvm_put_iommu_domain(domain);
 
 	return 0;
+}
+
+int pkvm_iommu_domain_alloc_did(u64 phys, u64 pgd_gpa)
+{
+	struct intel_iommu *iommu = iommu_from_phys(phys);
+	struct dmar_domain *domain;
+	int ret;
+
+	pkvm_warn("%s: phys=%llx pgd_gpa=0x%llx\n", __func__, phys, pgd_gpa);
+
+	if (!iommu) {
+		pkvm_err("%s: failed to get the iommu [phys:%llx]\n", __func__,
+			 phys);
+		return -EINVAL;
+	}
+
+	domain = __pkvm_get_iommu_domain(pkvm_host_gpa_to_virt(pgd_gpa));
+	if (!domain) {
+		pkvm_err("%s: failed to get the domain [pgd:%llx]\n", __func__,
+			 pgd_gpa);
+		return -EINVAL;
+	}
+
+	if (!iommu_domain_compatible(iommu, domain)) {
+		pkvm_err("%s: domain[pgd:%llx] is incompatible with iommu%d\n", __func__, pgd_gpa, iommu->seq_id);
+		pkvm_put_iommu_domain(domain);
+		return -EINVAL;
+	}
+
+	ret = pkvm_iommu_alloc_did(iommu, domain);
+	if (ret < 0) {
+		pkvm_put_iommu_domain(domain);
+	}
+
+	return ret;
+}
+
+int pkvm_iommu_domain_free_did(u64 phys, u64 pgd_gpa, u16 did)
+{
+	struct intel_iommu *iommu = iommu_from_phys(phys);
+	struct dmar_domain *domain;
+	int ret;
+
+	pkvm_warn("%s: phys=%llx pgd_gpa=0x%llx did=%d\n", __func__, phys, pgd_gpa, did);
+
+	if (!iommu) {
+		pkvm_err("%s: failed to get the iommu [phys:%llx]\n", __func__,
+			 phys);
+		return -EINVAL;
+	}
+
+	domain = __pkvm_get_iommu_domain(pkvm_host_gpa_to_virt(pgd_gpa));
+	if (!domain) {
+		pkvm_err("%s: failed to get the domain [pgd:%llx]\n", __func__,
+			 pgd_gpa);
+		return -EINVAL;
+	}
+
+	if (!iommu_domain_compatible(iommu, domain)) {
+		pkvm_err("%s: domain[pgd:%llx] is incompatible with iommu%d\n", __func__, pgd_gpa, iommu->seq_id);
+		pkvm_put_iommu_domain(domain);
+		return -EINVAL;
+	}
+
+	ret = pkvm_iommu_free_did(iommu, domain, did);
+	pkvm_put_iommu_domain(domain);
+	if (ret > 0) {
+		/* did is still attached, this is a bug */
+		pkvm_err("%s: failed to free did, still users: %d\n", __func__, ret);
+		return -EBUSY;
+	}
+
+	return ret;
 }

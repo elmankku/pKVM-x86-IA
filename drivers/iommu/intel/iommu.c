@@ -1509,6 +1509,7 @@ static void disable_dmar_iommu(struct intel_iommu *iommu)
 	 * All iommu domains must have been detached from the devices,
 	 * hence there should be no domain IDs in use.
 	 */
+	/* FIXME: Check hyp-owned DIDs when pKVM is enabled. */
 	if (WARN_ON(!ida_is_empty(&iommu->domain_ida)))
 		return;
 
@@ -1567,8 +1568,18 @@ int domain_attach_iommu(struct dmar_domain *domain, struct intel_iommu *iommu)
 		return 0;
 	}
 
+#ifdef CONFIG_PKVM_INTEL
+	// FIXME: Function...
+	if (pkvm_enabled()) {
+		num = pkvm_hypercall(iommu_alloc_did, iommu->reg_phys, virt_to_phys(domain->pgd));
+	} else {
+		num = ida_alloc_range(&iommu->domain_ida, IDA_START_DID,
+				      cap_ndoms(iommu->cap) - 1, GFP_KERNEL);
+	}
+#else
 	num = ida_alloc_range(&iommu->domain_ida, IDA_START_DID,
 			      cap_ndoms(iommu->cap) - 1, GFP_KERNEL);
+#endif
 	if (num < 0) {
 		pr_err("%s: No free domain ids\n", iommu->name);
 		goto err_unlock;
@@ -1587,7 +1598,16 @@ int domain_attach_iommu(struct dmar_domain *domain, struct intel_iommu *iommu)
 	return 0;
 
 err_clear:
+#ifdef CONFIG_PKVM_INTEL
+	// FIXME: Function...
+	if (pkvm_enabled()) {
+		WARN_ON(pkvm_hypercall(iommu_free_did, iommu->reg_phys, virt_to_phys(domain->pgd), info->did) != 0);
+	} else {
+		ida_free(&iommu->domain_ida, info->did);
+	}
+#else
 	ida_free(&iommu->domain_ida, info->did);
+#endif
 err_unlock:
 	kfree(info);
 	return ret;
@@ -1603,7 +1623,18 @@ void domain_detach_iommu(struct dmar_domain *domain, struct intel_iommu *iommu)
 	guard(mutex)(&iommu->did_lock);
 	info = xa_load(&domain->iommu_array, iommu->seq_id);
 	if (--info->refcnt == 0) {
+#ifdef CONFIG_PKVM_INTEL
+		// FIXME: Function...
+		if (pkvm_enabled()) {
+			WARN_ON(pkvm_hypercall(iommu_free_did, iommu->reg_phys,
+					       virt_to_phys(domain->pgd),
+					       info->did) != 0);
+		} else {
+			ida_free(&iommu->domain_ida, info->did);
+		}
+#else
 		ida_free(&iommu->domain_ida, info->did);
+#endif
 		xa_erase(&domain->iommu_array, iommu->seq_id);
 		kfree(info);
 	}
@@ -1703,6 +1734,12 @@ int domain_context_mapping_one(struct dmar_domain *domain,
 #endif
 
 	spin_lock(&iommu->lock);
+#ifdef __PKVM_HYP__
+	/* A lookup-time check cannot protect against concurrent DID release. */
+	ret = -EINVAL;
+	if (!pkvm_iommu_is_valid_did_locked(iommu, domain, did))
+		goto out_unlock;
+#endif
 	ret = -ENOMEM;
 	context = iommu_context_addr(iommu, bus, devfn, 1);
 	if (!context)
@@ -2387,8 +2424,10 @@ static int copy_context_table(struct intel_iommu *iommu,
 			continue;
 
 		did = context_domain_id(&ce);
-		if (did >= 0 && did < cap_ndoms(iommu->cap))
+		if (did >= 0 && did < cap_ndoms(iommu->cap)) {
+			/* FIXME: Reserve copied DIDs in hyp when pKVM is enabled. */
 			ida_alloc_range(&iommu->domain_ida, did, did, GFP_KERNEL);
+		}
 
 		set_context_copied(iommu, bus, devfn);
 		new_ce[idx] = ce;
@@ -3379,6 +3418,8 @@ static ssize_t domains_used_show(struct device *dev,
 	struct intel_iommu *iommu = dev_to_intel_iommu(dev);
 	unsigned int count = 0;
 	int id;
+
+	/* FIXME: Query hyp-owned DID usage when pKVM is enabled. */
 
 	for (id = 0; id < cap_ndoms(iommu->cap); id++)
 		if (ida_exists(&iommu->domain_ida, id))

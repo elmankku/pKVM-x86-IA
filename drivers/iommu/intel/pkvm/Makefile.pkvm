@@ -11,4 +11,4 @@ pkvm-hyp-$(CONFIG_PKVM_INTEL) += $(pkvm-iommu)/iommu.o $(pkvm-iommu)/iommu_frcd.
 				 $(pkvm-iommu)/iommu_pmu.o \
 				 $(intel-iommu)/iommu.o $(pkvm-iommu)/iommu_hc.o \
 				 $(intel-iommu)/dmar.o  $(intel-iommu)/pasid.o $(pkvm-iommu)/domain.o \
-				 $(pkvm-iommu)/cache.o $(intel-iommu)/cache.o
+				 $(pkvm-iommu)/cache.o $(intel-iommu)/cache.o $(pkvm-iommu)/did.o

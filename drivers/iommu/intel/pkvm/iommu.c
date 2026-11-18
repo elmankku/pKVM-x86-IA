@@ -42,7 +42,6 @@ unsigned int iommu_pglvl_mask = IOMMU_PGT_4LEVEL | IOMMU_PGT_5LEVEL;
 u16 satc_devs[PKVM_MAX_SATC_DEVS];
 int nr_satc_devs;
 
-#define PKVM_MAX_IOMMU_NUM	32
 static struct intel_iommu iommus[PKVM_MAX_IOMMU_NUM];
 static int nr_iommus;
 
@@ -856,9 +855,18 @@ int pkvm_iommu_msi_write(u64 phys, u32 offset, u32 data, u32 addr, u32 uaddr)
 int __init prepare_iommu(struct intel_iommu_info *info)
 {
 	struct intel_iommu *iommu;
+	unsigned int i;
 
 	if (nr_iommus >= PKVM_MAX_IOMMU_NUM)
 		return -ENOMEM;
+
+	if (info->seq_id < 0 || info->seq_id >= PKVM_MAX_IOMMU_NUM)
+		return -EINVAL;
+
+	for (i = 0; i < nr_iommus; i++) {
+		if (iommus[i].seq_id == info->seq_id)
+			return -EEXIST;
+	}
 
 	iommu = &iommus[nr_iommus++];
 	iommu->reg_phys = info->reg_phys;
@@ -891,6 +899,8 @@ static int iommu_init(struct intel_iommu *iommu)
 	}
 
 	pkvm_spin_lock_init(&iommu->lock);
+
+	pkvm_iommu_init_did(iommu);
 
 	pkvm_iommu_pmu_init(iommu);
 
