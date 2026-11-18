@@ -640,7 +640,7 @@ static bool pkvm_has_emulated_msr(struct kvm *kvm, u32 index)
 
 static int pkvm_vm_init(struct kvm *kvm)
 {
-	void *pkvm_vm, *pgd;
+	void *pkvm_vm, *pgd, *dma_pgd = NULL;
 	int ret;
 
 	/*
@@ -664,9 +664,19 @@ static int pkvm_vm_init(struct kvm *kvm)
 
 	kvm_account_pgtable_pages(pgd, 1);
 
-	ret = pkvm_hypercall(vm_init, __pa(kvm), __pa(pkvm_vm), __pa(pgd));
+	if (pkvm_is_protected_vm(kvm)) {
+		dma_pgd = (void *)__get_free_page(GFP_KERNEL_ACCOUNT);
+		if (!dma_pgd) {
+			ret = -ENOMEM;
+			goto free_pgtable_page;
+		}
+		kvm_account_pgtable_pages(dma_pgd, 1);
+	}
+
+	ret = pkvm_hypercall(vm_init, __pa(kvm), __pa(pkvm_vm), __pa(pgd),
+			     dma_pgd ? __pa(dma_pgd) : 0);
 	if (ret < 0)
-		goto free_pgtable_page;
+		goto free_dma_pgtable_page;
 
 	kvm->arch.pkvm.handle = ret;
 
@@ -675,6 +685,11 @@ static int pkvm_vm_init(struct kvm *kvm)
 
 	return 0;
 
+free_dma_pgtable_page:
+	if (dma_pgd) {
+		kvm_account_pgtable_pages(dma_pgd, -1);
+		free_page((unsigned long)dma_pgd);
+	}
 free_pgtable_page:
 	kvm_account_pgtable_pages(pgd, -1);
 	free_page((unsigned long)pgd);

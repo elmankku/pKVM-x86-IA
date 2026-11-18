@@ -2,6 +2,7 @@
 /* Copyright(c) 2026 Google. */
 
 
+#include "pkvm_iommu.h"
 #include <linux/hashtable.h>
 #include <asm/pkvm_spinlock.h>
 #include "pkvm.h"
@@ -64,6 +65,18 @@ static struct dmar_domain *__pkvm_get_iommu_domain(void *pgd)
 	return domain;
 }
 
+/* Domain operations requested by the host must not access a VM's tables. */
+static struct dmar_domain *get_host_iommu_domain(void *pgd)
+{
+	struct dmar_domain *domain = __pkvm_get_iommu_domain(pgd);
+
+	if (domain && domain->owner_vm) {
+		pkvm_put_iommu_domain(domain);
+		return NULL;
+	}
+	return domain;
+}
+
 /*
  * Retrieve the domain without incrementing refcount.
  * This is useful when there is a refcount on the domain which is guaranteed
@@ -95,6 +108,9 @@ static bool iommu_domain_compatible(struct intel_iommu *iommu,
 {
 	int addr_width;
 
+	if (domain->agaw < 0 || domain->agaw > level_to_agaw(5))
+		return false;
+
 	if (domain->use_first_level) {
 		if (!sm_supported(iommu) || !ecap_flts(iommu->ecap))
 			return false;
@@ -102,7 +118,15 @@ static bool iommu_domain_compatible(struct intel_iommu *iommu,
 		if ((domain->domain.type == IOMMU_DOMAIN_NESTED) !=
 		    pkvm_nested_enabled(iommu))
 			return false;
+
+		if (domain->agaw > iommu->agaw)
+			return false;
+		addr_width = agaw_to_width(iommu->agaw);
 	} else {
+		addr_width = agaw_to_width(domain->agaw);
+		/* A larger supported depth does not imply support for this depth. */
+		if (!(cap_sagaw(iommu->cap) & BIT(domain->agaw)))
+			return false;
 		if (sm_supported(iommu) && !ecap_slts(iommu->ecap))
 			return false;
 
@@ -114,14 +138,14 @@ static bool iommu_domain_compatible(struct intel_iommu *iommu,
 	    iommu_superpage_capability(iommu, domain->use_first_level))
 		return false;
 
-	if (domain->iommu_coherency !=
-	    iommu_paging_structure_coherency(iommu))
+	/* A domain that always flushes also works with a coherent walker. */
+	if (domain->iommu_coherency &&
+	    !iommu_paging_structure_coherency(iommu))
 		return false;
 
-	addr_width = agaw_to_width(iommu->agaw);
 	if (addr_width > cap_mgaw(iommu->cap))
 		addr_width = cap_mgaw(iommu->cap);
-	if (domain->gaw > addr_width || domain->agaw > iommu->agaw)
+	if (domain->gaw > addr_width)
 		return false;
 
 	return true;
@@ -135,7 +159,7 @@ struct dmar_domain *pkvm_get_iommu_domain(void *pgd, u16 did,
 	if (did == FLPT_DEFAULT_DID)
 		return &pt_domain;
 
-	domain = __pkvm_get_iommu_domain(pgd);
+	domain = get_host_iommu_domain(pgd);
 
 	if (domain && (!pkvm_iommu_is_valid_did(iommu, domain, did) ||
 		       !iommu_domain_compatible(iommu, domain))) {
@@ -195,7 +219,8 @@ static void free_domain_memcache(struct dmar_domain *domain,
 	}
 }
 
-int pkvm_free_iommu_domain(u64 pgd_gpa, struct pkvm_memcache *teardown_mc)
+int pkvm_free_iommu_domain(u64 pgd_gpa, struct pkvm_memcache *teardown_mc,
+			   struct pkvm_vm *owner)
 {
 	void *pgd = pkvm_host_gpa_to_virt(pgd_gpa);
 	struct dmar_domain *domain;
@@ -207,6 +232,11 @@ int pkvm_free_iommu_domain(u64 pgd_gpa, struct pkvm_memcache *teardown_mc)
 		pkvm_spin_unlock(&iommu_domain_lock);
 		pkvm_err("%s: no domain exist for pgd: %p\n", __func__, pgd);
 		return -EINVAL;
+	}
+
+	if (domain->owner_vm != owner) {
+		pkvm_spin_unlock(&iommu_domain_lock);
+		return -EPERM;
 	}
 
 	if (atomic_cmpxchg(&domain->refcount, 1, 0) != 1) {
@@ -225,8 +255,14 @@ int pkvm_free_iommu_domain(u64 pgd_gpa, struct pkvm_memcache *teardown_mc)
 	pkvm_spin_unlock(&iommu_domain_lock);
 
 	if (domain->domain.type != IOMMU_DOMAIN_NESTED) {
-		/* Unmap any remaining mappings. */
-		domain_unmap(domain, 0, DOMAIN_MAX_PFN(domain->gaw), NULL);
+		/*
+		 * Cover every root entry's full span so the unmap walker also frees
+		 * child tables when GAW covers only part of a root entry.
+		 */
+		if (domain->agaw != -1)
+			domain_unmap(domain, 0,
+				     DOMAIN_MAX_PFN(agaw_to_width(domain->agaw)), NULL);
+
 		free_domain_memcache(domain, teardown_mc);
 		/*
 		 * pgd was not allocated through memcache, but its safe to return to
@@ -249,7 +285,8 @@ int pkvm_free_iommu_domain(u64 pgd_gpa, struct pkvm_memcache *teardown_mc)
 }
 
 struct dmar_domain *pkvm_alloc_iommu_domain(struct alloc_domain_data *data,
-					    bool need_iotlb_sync_map)
+					    bool need_iotlb_sync_map,
+					    struct pkvm_vm *owner_vm)
 {
 	void *pgd = pkvm_host_gpa_to_virt(data->pgd_gpa);
 	struct dmar_domain *domain;
@@ -267,6 +304,7 @@ struct dmar_domain *pkvm_alloc_iommu_domain(struct alloc_domain_data *data,
 		__set_bit(index, iommu_domains_bitmap);
 		domain = &iommu_domains[index];
 		INIT_LIST_HEAD(&domain->cache_tags);
+		domain->owner_vm = owner_vm;
 		domain->pgd = pgd;
 		domain->use_first_level = data->use_first_level;
 		domain->iommu_superpage = data->iommu_superpage;
@@ -296,7 +334,8 @@ struct dmar_domain *pkvm_alloc_iommu_domain(struct alloc_domain_data *data,
 	return domain;
 }
 
-static int iommu_domain_map(struct domain_map_data *data)
+static int iommu_domain_map(struct domain_map_data *data,
+			    struct pkvm_vm *owner)
 {
 	struct dmar_domain *domain;
 	u64 iova, phys, size, end;
@@ -329,6 +368,19 @@ static int iommu_domain_map(struct domain_map_data *data)
 	}
 
 	pkvm_spin_lock(&domain->lock);
+	if (domain->owner_vm != owner) {
+		ret = -EPERM;
+		goto out_unlock;
+	}
+	if (domain->agaw < 0) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+	/* AGAW describes the tree; GAW may impose a smaller DMA aperture. */
+	if (owner && iova + size - 1 > __DOMAIN_MAX_ADDR(domain->gaw)) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
 	if (data->mc.count) {
 		ret = refill_domain_memcache(domain, &data->mc);
 		if (ret) {
@@ -355,7 +407,7 @@ out_put_domain:
 
 int pkvm_iommu_domain_map(struct domain_map_data *in, struct domain_map_data *out)
 {
-	int ret = iommu_domain_map(in);
+	int ret = iommu_domain_map(in, NULL);
 
 	*out = *in;
 	return ret;
@@ -366,7 +418,7 @@ int pkvm_iommu_domain_unmap(u64 pgd_gpa, u64 start_pfn, u64 last_pfn)
 	struct dmar_domain *domain;
 	int ret = 0;
 
-	domain = __pkvm_get_iommu_domain(pkvm_host_gpa_to_virt(pgd_gpa));
+	domain = get_host_iommu_domain(pkvm_host_gpa_to_virt(pgd_gpa));
 	if (!domain) {
 		pkvm_err("%s, failed to get the domain [pgd:%llx]\n",
 			 __func__, pgd_gpa);
@@ -401,7 +453,7 @@ int pkvm_iommu_domain_flush(u64 pgd_gpa, u64 start, u64 last, bool ih)
 		return -EINVAL;
 	}
 
-	domain = __pkvm_get_iommu_domain(pkvm_host_gpa_to_virt(pgd_gpa));
+	domain = get_host_iommu_domain(pkvm_host_gpa_to_virt(pgd_gpa));
 	if (!domain) {
 		pkvm_err("%s, failed to get the domain [pgd:%llx]\n",
 			 __func__, pgd_gpa);
@@ -442,7 +494,7 @@ int pkvm_iommu_domain_alloc_did(u64 phys, u64 pgd_gpa)
 		return -EINVAL;
 	}
 
-	domain = __pkvm_get_iommu_domain(pkvm_host_gpa_to_virt(pgd_gpa));
+	domain = get_host_iommu_domain(pkvm_host_gpa_to_virt(pgd_gpa));
 	if (!domain) {
 		pkvm_err("%s: failed to get the domain [pgd:%llx]\n", __func__,
 			 pgd_gpa);
@@ -463,6 +515,129 @@ int pkvm_iommu_domain_alloc_did(u64 phys, u64 pgd_gpa)
 	return ret;
 }
 
+/*
+ * Caller holds a VM reference. Configure the format once; later assignments
+ * must fit that format. This does not allocate a DID or program device entries.
+ */
+int pkvm_guest_iommu_configure_domain(struct pkvm_vm *vm,
+				    struct intel_iommu *iommu)
+{
+	struct dmar_domain *domain;
+	int agaw, gaw, ret = 0;
+
+	if (!iommu || !vm->dma_domain)
+		return -ENODEV;
+	if (!pkvm_is_protected_vm(&vm->kvm))
+		return -EPERM;
+
+	domain = __pkvm_get_iommu_domain(vm->dma_domain->pgd);
+	if (!domain)
+		return -ENODEV;
+
+	pkvm_spin_lock(&domain->lock);
+	if (domain->owner_vm != vm) {
+		ret = -EPERM;
+		goto unlock;
+	}
+	if (domain->agaw >= 0) {
+		if (!iommu_domain_compatible(iommu, domain))
+			ret = -EOPNOTSUPP;
+		goto unlock;
+	}
+
+	/* Use the host EPT depth selected from CPU and common IOMMU support. */
+	agaw = level_to_agaw(pkvm_host_ept_level());
+	if (agaw < level_to_agaw(4) || agaw > level_to_agaw(5) ||
+	    !(cap_sagaw(iommu->cap) & BIT(agaw)) ||
+	    (sm_supported(iommu) && !ecap_slts(iommu->ecap))) {
+		ret = -EOPNOTSUPP;
+		goto unlock;
+	}
+	gaw = min_t(int, agaw_to_width(agaw), cap_mgaw(iommu->cap));
+	if (gaw < VTD_PAGE_SHIFT) {
+		ret = -EOPNOTSUPP;
+		goto unlock;
+	}
+
+	domain->use_first_level = false;
+	domain->iommu_superpage = 0;
+	/* Keep these conservative policies fixed as more devices are added. */
+	domain->iommu_coherency = false;
+	domain->iotlb_sync_map = true;
+	domain->gaw = gaw;
+	domain->max_addr = __DOMAIN_MAX_ADDR(gaw);
+	domain_flush_cache(domain, domain->pgd, VTD_PAGE_SIZE);
+	/* Publish readiness under the same lock used by map/unmap. */
+	domain->agaw = agaw;
+unlock:
+	pkvm_spin_unlock(&domain->lock);
+	pkvm_put_iommu_domain(domain);
+	return ret;
+}
+
+int pkvm_guest_iommu_init_domain(struct pkvm_vm *vm, phys_addr_t pgd_pa)
+{
+	struct dmar_domain *domain;
+	struct alloc_domain_data data;
+	int ret;
+
+	if (!vm)
+		return -EINVAL;
+
+	if (!pkvm_is_protected_vm(&vm->kvm)) {
+		/* Per-VM domain is only used by pVMs */
+		return 0;
+	}
+
+	if (!pgd_pa)
+		return -EINVAL;
+
+	ret = pkvm_host_donate_hyp(pgd_pa, PAGE_SIZE, true);
+	if (ret)
+		return ret;
+
+	memset(&data, 0, sizeof(data));
+	data.pgd_gpa = pgd_pa;
+	data.use_first_level = false;
+
+	domain = pkvm_alloc_iommu_domain(&data, true, vm);
+	if (IS_ERR(domain)) {
+		pkvm_err("%s: domain alloc failed for protected VM (err=%ld)\n",
+			 __func__, PTR_ERR(domain));
+		pkvm_hyp_donate_host(pgd_pa, PAGE_SIZE, false);
+		return PTR_ERR(domain);
+	}
+	domain->agaw = -1;
+	vm->dma_domain = domain;
+
+	return 0;
+}
+
+int pkvm_guest_iommu_free_domain(struct pkvm_vm *vm, struct pkvm_memcache *mc)
+{
+	struct pkvm_memcache dummy = {};
+	int ret;
+
+	if (!vm) {
+		return -EINVAL;
+	}
+
+	if (!pkvm_is_protected_vm(&vm->kvm)) {
+		/* Per-VM domain is only used by pVMs */
+		return 0;
+	}
+
+	if (!mc) {
+		mc = &dummy;
+	}
+
+	ret = pkvm_free_iommu_domain(pkvm_virt_to_host_gpa(vm->dma_domain->pgd), mc, vm);
+	if (!ret)
+		vm->dma_domain = NULL;
+
+	return ret;
+}
+
 int pkvm_iommu_domain_free_did(u64 phys, u64 pgd_gpa, u16 did)
 {
 	struct intel_iommu *iommu = iommu_from_phys(phys);
@@ -477,7 +652,7 @@ int pkvm_iommu_domain_free_did(u64 phys, u64 pgd_gpa, u16 did)
 		return -EINVAL;
 	}
 
-	domain = __pkvm_get_iommu_domain(pkvm_host_gpa_to_virt(pgd_gpa));
+	domain = get_host_iommu_domain(pkvm_host_gpa_to_virt(pgd_gpa));
 	if (!domain) {
 		pkvm_err("%s: failed to get the domain [pgd:%llx]\n", __func__,
 			 pgd_gpa);

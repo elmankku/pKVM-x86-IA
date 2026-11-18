@@ -657,6 +657,8 @@ struct qi_batch {
 	unsigned int index;
 };
 
+struct pkvm_vm;
+
 struct dmar_domain {
 #ifndef __PKVM_HYP__
 	int	nid;			/* node id */
@@ -763,6 +765,9 @@ struct dmar_domain {
 	int		agaw;
 	/* maximum mapped address */
 	u64		max_addr;
+
+	/* NULL for host domains; borrowed pointer for a VM-owned domain. */
+	struct pkvm_vm *owner_vm;
 
 	atomic_t refcount;
 	unsigned int index;

@@ -132,7 +132,7 @@ static struct pkvm_vm *free_pkvm_vm_handle(int handle)
 }
 
 static int pkvm_vm_init(phys_addr_t host_kvm_pa, phys_addr_t pkvm_vm_pa,
-			phys_addr_t pgd_pa)
+			phys_addr_t pgd_pa, phys_addr_t dma_pgd_pa)
 {
 	struct pkvm_vm *pkvm_vm;
 	struct kvm *kvm;
@@ -161,6 +161,12 @@ static int pkvm_vm_init(phys_addr_t host_kvm_pa, phys_addr_t pkvm_vm_pa,
 	}
 
 	kvm->arch.vm_type = vm_type;
+	if (pkvm_is_protected_vm(kvm) != !!dma_pgd_pa ||
+	    !PAGE_ALIGNED(dma_pgd_pa)) {
+		ret = -EINVAL;
+		goto undonate;
+	}
+
 	if (pkvm_is_protected_vm(kvm))
 		kvm->arch.disabled_quirks = kvm_caps.inapplicable_quirks &
 					    kvm_caps.supported_quirks;
@@ -177,9 +183,13 @@ static int pkvm_vm_init(phys_addr_t host_kvm_pa, phys_addr_t pkvm_vm_pa,
 	if (ret)
 		goto undonate;
 
+	ret = pkvm_guest_iommu_init_domain(pkvm_vm, dma_pgd_pa);
+	if (ret)
+		goto mmu_destroy;
+
 	ret = allocate_pkvm_vm_handle(pkvm_vm);
 	if (ret < 0)
-		goto mmu_destroy;
+		goto iommu_destroy;
 
 	ret = kvm_x86_call(vm_init)(kvm);
 	if (ret)
@@ -189,6 +199,8 @@ static int pkvm_vm_init(phys_addr_t host_kvm_pa, phys_addr_t pkvm_vm_pa,
 
 free_handle:
 	free_pkvm_vm_handle(kvm->arch.pkvm.handle);
+iommu_destroy:
+	pkvm_guest_iommu_free_domain(pkvm_vm, NULL);
 mmu_destroy:
 	pkvm_guest_mmu_destroy(pkvm_vm);
 undonate:
@@ -237,6 +249,8 @@ static int pkvm_vm_destroy(int vm_handle, struct pkvm_memcache *mc)
 	shared_kvm_pa = __pkvm_pa(pkvm_vm->shared_kvm);
 
 	kvm_x86_call(vm_destroy)(&pkvm_vm->kvm);
+
+	pkvm_guest_iommu_free_domain(pkvm_vm, &pkvm_vm->shared_kvm->arch.pkvm.guest_mmu_teardown_mc);
 
 	pkvm_guest_mmu_destroy(pkvm_vm);
 
@@ -2096,7 +2110,8 @@ void pkvm_handle_host_hypercall(struct kvm_vcpu *vcpu)
 	case __pkvm__vm_init:
 		ret = pkvm_vm_init(pkvm_host_gpa_to_phys(pkvm_hc_input1(vcpu)),
 				   pkvm_host_gpa_to_phys(pkvm_hc_input2(vcpu)),
-				   pkvm_host_gpa_to_phys(pkvm_hc_input3(vcpu)));
+				   pkvm_host_gpa_to_phys(pkvm_hc_input3(vcpu)),
+				   pkvm_host_gpa_to_phys(pkvm_hc_input4(vcpu)));
 		break;
 	case __pkvm__vm_finalize:
 		ret = pkvm_vm_finalize(pkvm_hc_input1(vcpu));

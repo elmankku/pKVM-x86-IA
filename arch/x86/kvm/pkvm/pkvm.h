@@ -50,6 +50,8 @@ struct pkvm_vcpu {
 /* The pkvm_vcpu structure size w/o struct kvm_vcpu */
 #define PKVM_VCPU_BASE_SIZE		offsetof(struct pkvm_vcpu, vcpu)
 
+struct dmar_domain;
+
 /* Represents a guest VM. */
 struct pkvm_vm {
 	/* Point to the kvm structure owned by the host */
@@ -67,6 +69,10 @@ struct pkvm_vm {
 	struct pkvm_pgtable mmu;
 	struct pkvm_pool mmu_pool;
 	pkvm_spinlock_t mmu_lock;
+#ifdef CONFIG_PKVM_INTEL
+       /* Owned by this VM; publication is protected by mmu_lock. */
+       struct dmar_domain *dma_domain;
+#endif
 	/*
 	 * The struct kvm should be the last element. In cases where struct kvm
 	 * is wrapped by a vendor specific structure, putting it as the last

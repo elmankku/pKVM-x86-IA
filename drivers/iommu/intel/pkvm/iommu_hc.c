@@ -509,7 +509,7 @@ int pkvm_iommu_alloc_domain(struct alloc_domain_data *data)
 	}
 
 	need_iotlb_sync_map = cap_caching_mode(iommu->cap) && !data->use_first_level;
-	domain = pkvm_alloc_iommu_domain(data, need_iotlb_sync_map);
+	domain = pkvm_alloc_iommu_domain(data, need_iotlb_sync_map, NULL);
 	if (IS_ERR(domain)) {
 		pkvm_err("%s: domain alloc failed for device[%x] (err=%ld)\n",
 			 __func__, data->bdf, PTR_ERR(domain));
@@ -529,7 +529,7 @@ int pkvm_iommu_alloc_domain(struct alloc_domain_data *data)
 int pkvm_iommu_free_domain(u64 pgd_gpa, struct pkvm_memcache *mc)
 {
 	memset(mc, 0, sizeof(*mc));
-	return pkvm_free_iommu_domain(pgd_gpa, mc);
+	return pkvm_free_iommu_domain(pgd_gpa, mc, NULL);
 }
 
 int pkvm_iommu_modify_irte(struct modify_irte_data *data)

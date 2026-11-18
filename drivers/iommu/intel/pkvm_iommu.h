@@ -32,6 +32,7 @@ struct intel_iommu;
 struct dmar_domain;
 struct device_domain_info;
 struct irte;
+struct pkvm_vm;
 
 #define PKVM_MAX_DIDS (1U << 16)
 
@@ -194,12 +195,14 @@ bool is_dev_in_satc(u16 bdf);
 bool pkvm_iommu_paging_structure_coherency(void);
 
 struct dmar_domain *pkvm_alloc_iommu_domain(struct alloc_domain_data *data,
-					    bool need_iotlb_sync_map);
+					    bool need_iotlb_sync_map,
+					    struct pkvm_vm *owner);
 struct dmar_domain *pkvm_get_iommu_domain(void *pgd, u16 did,
 					  struct intel_iommu *iommu);
 struct dmar_domain *pkvm_get_iommu_domain_noref(void *pgd, u16 did);
 void pkvm_put_iommu_domain(struct dmar_domain *domain);
-int pkvm_free_iommu_domain(u64 pgd_gpa, struct pkvm_memcache *teardown_mc);
+int pkvm_free_iommu_domain(u64 pgd_gpa, struct pkvm_memcache *teardown_mc,
+			   struct pkvm_vm *owner);
 
 struct cache_tag *pkvm_alloc_cache_tag(void);
 void pkvm_free_cache_tag(struct cache_tag *cache_tag);
@@ -235,6 +238,11 @@ bool pkvm_iommu_is_valid_did(struct intel_iommu *iommu,
 /* Caller holds iommu->lock across validation and context publication. */
 bool pkvm_iommu_is_valid_did_locked(struct intel_iommu *iommu,
 				    struct dmar_domain *domain, u16 did);
+
+int pkvm_guest_iommu_configure_domain(struct pkvm_vm *vm,
+				    struct intel_iommu *iommu);
+int pkvm_guest_iommu_init_domain(struct pkvm_vm *vm, phys_addr_t pgd_pa);
+int pkvm_guest_iommu_free_domain(struct pkvm_vm *vm, struct pkvm_memcache *mc);
 
 /*
  * Return value from a pKVM MMIO register validator meaning "this offset is not
