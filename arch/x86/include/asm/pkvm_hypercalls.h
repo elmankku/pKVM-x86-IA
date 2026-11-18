@@ -108,6 +108,7 @@ PKVM_HC(iommu_domain_flush)
 PKVM_HC_IN(iommu_modify_irte)
 PKVM_HC(iommu_alloc_did)
 PKVM_HC(iommu_free_did)
+PKVM_HC_INOUT(vm_iommu_refill_memcache)
 #endif
 
 /* device hypercalls */

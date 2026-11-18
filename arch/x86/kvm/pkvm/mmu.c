@@ -2014,3 +2014,73 @@ void pkvm_host_unuse_dma(unsigned long phys, unsigned long size)
 unlock:
 	pkvm_host_mmu_unlock();
 }
+
+/* Translate and pin one already donated guest page for a DMA mapping. */
+int pkvm_guest_pin_dma_page(struct pkvm_vm *vm, unsigned long gpa,
+			    unsigned long *phys)
+{
+	const struct pkvm_pgtable_ops *ops = vm->mmu.pgt_ops;
+	enum pkvm_page_state guest_state, host_state;
+	struct pkvm_page *page;
+	u64 pte;
+	int level, ret;
+
+	if (!pkvm_is_protected_vm(&vm->kvm) || !PAGE_ALIGNED(gpa) ||
+	    gpa >= pkvm_pgtable_max_size(&vm->mmu))
+		return -EINVAL;
+
+	pkvm_host_mmu_lock();
+	pkvm_guest_mmu_lock(vm);
+	ret = pkvm_pgtable_lookup(&vm->mmu, gpa, &pte, &level);
+	if (ret)
+		goto unlock;
+
+	ret = -EPERM;
+	if (!ops->pte_present(&pte))
+		goto unlock;
+
+	guest_state = ops->pte_pgstate(&pte);
+	if (guest_state == PKVM_PAGE_OWNED)
+		host_state = PKVM_PAGE_NONE;
+	else if (guest_state == PKVM_PAGE_SHARED_OWNED)
+		host_state = PKVM_PAGE_SHARED_BORROWED;
+	else
+		goto unlock;
+
+	/* Include the offset within a potentially huge guest mapping. */
+	*phys = ops->pte_to_phys(&pte) + (gpa & ~ops->level_to_mask(level));
+	ret = check_host_mem_pgstate(*phys, PAGE_SIZE, host_state,
+				     PKVM_ID_GUEST, false);
+	if (ret)
+		goto unlock;
+
+	page = pkvm_phys_to_page(*phys);
+	if (page->refcount == USHRT_MAX) {
+		ret = -EOVERFLOW;
+		goto unlock;
+	}
+	pkvm_page_ref_inc(page);
+unlock:
+	pkvm_guest_mmu_unlock(vm);
+	pkvm_host_mmu_unlock();
+	return ret;
+}
+
+/* The IOMMU invalidation must complete before dropping these references. */
+void pkvm_guest_unuse_dma(unsigned long phys, unsigned long size)
+{
+	if (WARN_ON_ONCE(!is_valid_addr_range(phys, size, true)))
+		return;
+
+	pkvm_host_mmu_lock();
+	if (WARN_ON_ONCE(check_host_mem_pgstate_mask(phys, size,
+						     BIT(PKVM_PAGE_NONE) |
+						     BIT(PKVM_PAGE_SHARED_BORROWED),
+						     PKVM_ID_GUEST, false)))
+		goto unlock;
+
+	for_each_pkvm_page(page, phys, size)
+		pkvm_page_ref_dec(page);
+unlock:
+	pkvm_host_mmu_unlock();
+}

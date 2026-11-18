@@ -89,6 +89,8 @@
 #ifdef __PKVM_HYP__
 #include "pkvm.h"
 #include "pkvm/mmu.h"
+#include "pkvm/debug.h"
+#include "pkvm_iommu.h"
 
 #undef module_param_named
 #define module_param_named(...)
@@ -10687,6 +10689,22 @@ static int pkvm_start_secondary_vcpu(struct kvm *kvm, int apic_id)
 	return 0;
 }
 
+static int pkvm_refill_guest_iommu_memcache(struct kvm_vcpu *vcpu)
+{
+	union pkvm_hc_data d = { 0 };
+	struct pkvm_memcache *mc = &d.vm_iommu_refill_memcache.in.memcache;
+	int ret;
+
+	d.vm_iommu_refill_memcache.in.vm_handle = vcpu->kvm->arch.pkvm.handle;
+	init_pkvm_mmu_memcache(mc);
+	ret = kvm_topup_pkvm_memcache(mc, vcpu->arch.pkvm.req_param);
+	if (!ret)
+		ret = pkvm_hypercall_inout(vm_iommu_refill_memcache, &d, &d);
+	/* The hypercall returns the descriptor even after partial donation. */
+	kvm_free_pkvm_memcache(mc);
+	return ret;
+}
+
 static int kvm_pkvm_hypercall(struct kvm_vcpu *vcpu)
 {
 	unsigned long nr = kvm_rax_read(vcpu);
@@ -10751,6 +10769,12 @@ static int kvm_pkvm_hypercall(struct kvm_vcpu *vcpu)
 		ret = pkvm_start_secondary_vcpu(vcpu->kvm, kvm_rbx_read(vcpu));
 		kvm_rax_write(vcpu, ret);
 		ret = 1;
+		break;
+	case PKVM_GHC_IOMMU_MAP:
+		/* Like share/unshare, refill failures are returned to the VMM. */
+		ret = pkvm_refill_guest_iommu_memcache(vcpu);
+		if (!ret)
+			ret = 1;
 		break;
 	default:
 		ret = 1;
@@ -15090,11 +15114,19 @@ int pkvm_vcpu_enter_guest(struct kvm_vcpu *vcpu, bool force_immediate_exit,
 	return ret;
 }
 
+static int pkvm_complete_iommu_hypercall(struct kvm_vcpu *vcpu,
+					 int status, u64 done)
+{
+	kvm_rax_write(vcpu, status);
+	kvm_rdx_write(vcpu, done);
+	return kvm_skip_emulated_instruction(vcpu);
+}
+
 int pkvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 {
 	struct pkvm_vcpu *pkvm_vcpu = to_pkvm_vcpu(vcpu);
 	unsigned long min_pages;
-	u64 nr, a0, a1, a2, a3;
+	u64 nr, a0, a1, a2, a3, done = 0;
 	int ret = -KVM_EPERM;
 
 	if (!pkvm_is_protected_vcpu(vcpu))
@@ -15135,6 +15167,27 @@ int pkvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 	case PKVM_GHC_IOWRITE:
 		/* Hypercall for MMIO accessing should be forwarded to the host */
 		return 0;
+	case PKVM_GHC_IOMMU_GET_IOVA_BITS:
+		ret = pkvm_guest_iommu_domain_get_iova_bits(pkvm_vcpu->pkvm_vm);
+		break;
+	case PKVM_GHC_IOMMU_MAP:
+	case PKVM_GHC_IOMMU_UNMAP:
+		if (!is_64_bit_hypercall(vcpu))
+			return pkvm_complete_iommu_hypercall(vcpu, -EOPNOTSUPP,
+							     0);
+		if (nr == PKVM_GHC_IOMMU_MAP) {
+			ret = pkvm_guest_iommu_domain_map(pkvm_vcpu->pkvm_vm,
+							  a0, a1, a2, a3, &done,
+							  &min_pages);
+			if (ret == -E2BIG) {
+				/* Preflight failed: preserve the call for a refill retry. */
+				pkvm_vcpu->shared_vcpu->arch.pkvm.req_param = min_pages;
+				return 0;
+			}
+		} else {
+			ret = pkvm_guest_iommu_domain_unmap(pkvm_vcpu->pkvm_vm, a0, a1, &done);
+		}
+		return pkvm_complete_iommu_hypercall(vcpu, ret, done);
 	case PKVM_GHC_START_CPU:
 		ret = pkvm_start_secondary_vcpu(vcpu->kvm, a0, a1);
 		if (!ret) {

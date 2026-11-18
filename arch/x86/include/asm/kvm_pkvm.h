@@ -135,6 +135,11 @@ struct alloc_domain_data {
 	u8 pkvm_nested: 1;
 };
 
+struct vm_iommu_refill_data {
+	u64 vm_handle;
+	struct pkvm_memcache memcache;
+};
+
 struct domain_map_data {
 	u64 pgd_gpa;
 	u64 iov_pfn;
@@ -264,6 +269,10 @@ union pkvm_hc_data {
 		struct domain_map_data in;
 		struct domain_map_data out;
 	} iommu_domain_map;
+	union {
+		struct vm_iommu_refill_data in;
+		struct vm_iommu_refill_data out;
+	} vm_iommu_refill_memcache;
 	struct {
 		struct modify_irte_data data;
 	} iommu_modify_irte;

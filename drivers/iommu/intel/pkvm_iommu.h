@@ -252,10 +252,17 @@ int pkvm_guest_iommu_detach_device(struct pkvm_vm *vm,
 int pkvm_guest_iommu_get_did(struct pkvm_vm *vm, struct intel_iommu *iommu);
 int pkvm_guest_iommu_put_did(struct pkvm_vm *vm, struct intel_iommu *iommu,
 			   u16 did);
+int pkvm_guest_iommu_domain_get_iova_bits(struct pkvm_vm *vm);
 int pkvm_guest_iommu_configure_domain(struct pkvm_vm *vm,
 				    struct intel_iommu *iommu);
 int pkvm_guest_iommu_init_domain(struct pkvm_vm *vm, phys_addr_t pgd_pa);
 int pkvm_guest_iommu_free_domain(struct pkvm_vm *vm, struct pkvm_memcache *mc);
+int pkvm_guest_iommu_refill_memcache(u64 vm_handle, struct pkvm_memcache *host_mc);
+int pkvm_guest_iommu_domain_map(struct pkvm_vm *vm, u64 iova, u64 gpa, u64 size,
+				u64 prot, u64 *mapped,
+				unsigned long *need_mc_pages);
+int pkvm_guest_iommu_domain_unmap(struct pkvm_vm *vm, u64 iova, u64 size,
+				  u64 *unmapped);
 
 /*
  * Return value from a pKVM MMIO register validator meaning "this offset is not

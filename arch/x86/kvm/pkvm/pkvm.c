@@ -2236,6 +2236,12 @@ void pkvm_handle_host_hypercall(struct kvm_vcpu *vcpu)
 		ret = pkvm_iommu_domain_map(&in.iommu_domain_map.in,
 					    &out.iommu_domain_map.out);
 		break;
+	case __pkvm__vm_iommu_refill_memcache:
+		out.vm_iommu_refill_memcache.out = in.vm_iommu_refill_memcache.in;
+		ret = pkvm_guest_iommu_refill_memcache(
+			in.vm_iommu_refill_memcache.in.vm_handle,
+			&out.vm_iommu_refill_memcache.out.memcache);
+		break;
 	case __pkvm__iommu_domain_unmap:
 		ret = pkvm_iommu_domain_unmap(pkvm_hc_input1(vcpu),
 					      pkvm_hc_input2(vcpu),

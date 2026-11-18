@@ -1036,6 +1036,15 @@ next:
 }
 
 #ifdef __PKVM_HYP__
+static void domain_unuse_dma(struct dmar_domain *domain, unsigned long phys,
+			     unsigned long size)
+{
+	if (domain->owner_vm)
+		pkvm_guest_unuse_dma(phys, size);
+	else
+		pkvm_host_unuse_dma(phys, size);
+}
+
 /*
  * Release(unpin) physical pages reachable by pte that were previously
  * mapped for DMA. Free the page if all PTEs in the page is released.
@@ -1050,7 +1059,7 @@ static void dma_unuse_pte(struct dmar_domain *domain,
 	if (level == 1) {
 		do {
 			if (dma_pte_mapped(pte)) {
-				pkvm_host_unuse_dma(dma_pte_addr(pte), VTD_PAGE_SIZE);
+				domain_unuse_dma(domain, dma_pte_addr(pte), VTD_PAGE_SIZE);
 				dma_clear_pte(pte);
 			}
 			pte++;
@@ -1061,7 +1070,7 @@ static void dma_unuse_pte(struct dmar_domain *domain,
 				if (!dma_pte_superpage(pte))
 					dma_unuse_pte(domain, level - 1, pte);
 				else
-					pkvm_host_unuse_dma(dma_pte_addr(pte),
+					domain_unuse_dma(domain, dma_pte_addr(pte),
 							    level_size(level) * VTD_PAGE_SIZE);
 				dma_clear_pte(pte);
 			}
@@ -1097,7 +1106,7 @@ static void dma_unuse_range(struct dmar_domain *domain, int level,
 			if (level > 1 && !dma_pte_superpage(pte))
 				dma_unuse_pte(domain, level - 1, pte);
 			else
-				pkvm_host_unuse_dma(dma_pte_addr(pte),
+				domain_unuse_dma(domain, dma_pte_addr(pte),
 						    level_size(level) * VTD_PAGE_SIZE);
 
 			dma_clear_pte(pte);
@@ -1160,6 +1169,26 @@ void domain_unmap(struct dmar_domain *domain, unsigned long start_pfn,
 			domain->pgd, 0, start_pfn, last_pfn);
 #endif
 }
+
+#ifdef __PKVM_HYP__
+/* Caller holds domain->lock. Guest mappings currently use 4 KiB leaves. */
+int domain_unmap_page(struct dmar_domain *domain, unsigned long pfn)
+{
+	struct dma_pte *pte;
+	int level = 0;
+
+	if (!domain_pfn_supported(domain, pfn))
+		return -EINVAL;
+	pte = dma_pfn_level_pte(domain, pfn, 1, &level);
+	if (!pte || !dma_pte_present(pte))
+		return -ENOENT;
+	if (dma_pte_superpage(pte))
+		return -EOPNOTSUPP;
+
+	domain_unmap(domain, pfn, pfn, NULL);
+	return 0;
+}
+#endif
 
 #ifndef __PKVM_HYP__
 /* iommu handling */
@@ -1960,9 +1989,16 @@ int domain_map(struct dmar_domain *domain, unsigned long iov_pfn,
 #endif
 
 #ifdef __PKVM_HYP__
-	ret = pkvm_host_use_dma(phys_pfn << VTD_PAGE_SHIFT, nr_pages * VTD_PAGE_SIZE);
-	if (ret)
-		return ret;
+	/* Guest callers supply one page with a DMA reference already held. */
+	if (domain->owner_vm) {
+		if (WARN_ON_ONCE(nr_pages != 1))
+			return -EINVAL;
+	} else {
+		ret = pkvm_host_use_dma(phys_pfn << VTD_PAGE_SHIFT,
+					nr_pages * VTD_PAGE_SIZE);
+		if (ret)
+			return ret;
+	}
 #endif
 
 	attr = prot & (DMA_PTE_READ | DMA_PTE_WRITE | DMA_PTE_SNP);
@@ -2024,6 +2060,11 @@ int domain_map(struct dmar_domain *domain, unsigned long iov_pfn,
 				.val = pteval,
 			};
 
+			if (domain->owner_vm) {
+				ret = -EEXIST;
+				goto out;
+			}
+
 			/*
 			 * Either the pte is mapped with a different value or
 			 * the same value, should unpin the previous pinned
@@ -2071,14 +2112,14 @@ int domain_map(struct dmar_domain *domain, unsigned long iov_pfn,
 
 out:
 #ifdef __PKVM_HYP__
-	if (domain->iotlb_sync_map) {
+	if (domain->iotlb_sync_map && flush_nr_pages != nr_pages) {
 		flush_nr_pages -= nr_pages;
 		cache_tag_flush_range_np(domain, flush_iov_pfn << VTD_PAGE_SHIFT,
 					 (flush_iov_pfn + flush_nr_pages - 1) << VTD_PAGE_SHIFT);
 	}
 
 	/* Unpin pages that are not mapped */
-	if (nr_pages)
+	if (nr_pages && !domain->owner_vm)
 		pkvm_host_unuse_dma(phys_pfn << VTD_PAGE_SHIFT, nr_pages * VTD_PAGE_SIZE);
 #endif
 	return ret;

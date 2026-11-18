@@ -9849,8 +9849,8 @@ static void update_protected_vcpu_state(struct kvm_vcpu *vcpu,
 		break;
 	case EXIT_REASON_VMCALL:
 		/*
-		 * If the memory (un)share hypercall has been handled by the host,
-		 * not by pKVM alone, it indicates that there were not enough
+		 * Memory (un)share and IOMMU map calls reach the host only to
+		 * refill their respective memcaches. This means there were not enough
 		 * pages in the memcache for pKVM to handle the hypercall, and
 		 * now the host has refilled the memcache with the needed number
 		 * of pages and the hypercall should be retried. So don't skip
@@ -9858,7 +9858,8 @@ static void update_protected_vcpu_state(struct kvm_vcpu *vcpu,
 		 * See also comments in kvm_pkvm_hypercall().
 		 */
 		if (kvm_rax_read(vcpu) == PKVM_GHC_SHARE_MEM ||
-		    kvm_rax_read(vcpu) == PKVM_GHC_UNSHARE_MEM)
+		    kvm_rax_read(vcpu) == PKVM_GHC_UNSHARE_MEM ||
+		    kvm_rax_read(vcpu) == PKVM_GHC_IOMMU_MAP)
 			break;
 
 		/*

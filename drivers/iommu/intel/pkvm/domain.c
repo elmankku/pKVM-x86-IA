@@ -2,6 +2,8 @@
 /* Copyright(c) 2026 Google. */
 
 
+#include "asm/kvm_pkvm.h"
+#include "linux/bitops.h"
 #include "pkvm_iommu.h"
 #include <linux/hashtable.h>
 #include <asm/pkvm_spinlock.h>
@@ -335,11 +337,14 @@ struct dmar_domain *pkvm_alloc_iommu_domain(struct alloc_domain_data *data,
 }
 
 static int iommu_domain_map(struct domain_map_data *data,
-			    struct pkvm_vm *owner)
+			    struct pkvm_vm *owner, unsigned long *need_mc_pages)
 {
 	struct dmar_domain *domain;
 	u64 iova, phys, size, end;
 	int ret;
+
+	if (!data->nr_pages)
+		return -EINVAL;
 
 	/* Check for possible overflows that may have security implications */
 	if (check_shl_overflow(data->iov_pfn, VTD_PAGE_SHIFT, &iova))
@@ -391,6 +396,10 @@ static int iommu_domain_map(struct domain_map_data *data,
 	}
 	if (domain->mc.count < __pkvm_pgtable_max_pages(data->nr_pages)) {
 		ret = -ENOMEM;
+		if (need_mc_pages) {
+			*need_mc_pages = __pkvm_pgtable_max_pages(data->nr_pages);
+			ret = -E2BIG;
+		}
 		goto out_unlock;
 	}
 
@@ -407,7 +416,7 @@ out_put_domain:
 
 int pkvm_iommu_domain_map(struct domain_map_data *in, struct domain_map_data *out)
 {
-	int ret = iommu_domain_map(in, NULL);
+	int ret = iommu_domain_map(in, NULL, NULL);
 
 	*out = *in;
 	return ret;
@@ -515,6 +524,44 @@ int pkvm_iommu_domain_alloc_did(u64 phys, u64 pgd_gpa)
 	return ret;
 }
 
+int pkvm_iommu_domain_free_did(u64 phys, u64 pgd_gpa, u16 did)
+{
+	struct intel_iommu *iommu = iommu_from_phys(phys);
+	struct dmar_domain *domain;
+	int ret;
+
+	pkvm_warn("%s: phys=%llx pgd_gpa=0x%llx did=%d\n", __func__, phys, pgd_gpa, did);
+
+	if (!iommu) {
+		pkvm_err("%s: failed to get the iommu [phys:%llx]\n", __func__,
+			 phys);
+		return -EINVAL;
+	}
+
+	domain = get_host_iommu_domain(pkvm_host_gpa_to_virt(pgd_gpa));
+	if (!domain) {
+		pkvm_err("%s: failed to get the domain [pgd:%llx]\n", __func__,
+			 pgd_gpa);
+		return -EINVAL;
+	}
+
+	if (!iommu_domain_compatible(iommu, domain)) {
+		pkvm_err("%s: domain[pgd:%llx] is incompatible with iommu%d\n", __func__, pgd_gpa, iommu->seq_id);
+		pkvm_put_iommu_domain(domain);
+		return -EINVAL;
+	}
+
+	ret = pkvm_iommu_free_did(iommu, domain, did);
+	pkvm_put_iommu_domain(domain);
+	if (ret > 0) {
+		/* did is still attached, this is a bug */
+		pkvm_err("%s: failed to free did, still users: %d\n", __func__, ret);
+		return -EBUSY;
+	}
+
+	return ret;
+}
+
 /* Caller holds a VM reference throughout acquisition or release. */
 static struct dmar_domain *get_guest_iommu_domain(struct pkvm_vm *vm)
 {
@@ -533,6 +580,21 @@ static struct dmar_domain *get_guest_iommu_domain(struct pkvm_vm *vm)
 		return ERR_PTR(-EPERM);
 	}
 	return domain;
+}
+
+int pkvm_guest_iommu_domain_get_iova_bits(struct pkvm_vm *vm)
+{
+	struct dmar_domain *domain = get_guest_iommu_domain(vm);
+	int ret;
+
+	if (IS_ERR(domain))
+		return PTR_ERR(domain);
+
+	pkvm_spin_lock(&domain->lock);
+	ret = domain->agaw < 0 ? -ENODEV : domain->gaw;
+	pkvm_spin_unlock(&domain->lock);
+	pkvm_put_iommu_domain(domain);
+	return ret;
 }
 
 /* Caller holds devices_lock across attachment and assignment publication. */
@@ -750,40 +812,118 @@ int pkvm_guest_iommu_free_domain(struct pkvm_vm *vm, struct pkvm_memcache *mc)
 	return ret;
 }
 
-int pkvm_iommu_domain_free_did(u64 phys, u64 pgd_gpa, u16 did)
+int pkvm_guest_iommu_refill_memcache(u64 vm_handle, struct pkvm_memcache *host_mc)
 {
-	struct intel_iommu *iommu = iommu_from_phys(phys);
+	struct pkvm_memcache incoming = { 0 };
+	struct dmar_domain *domain;
+	struct pkvm_vm *vm;
+	void *page;
+	int ret = -EINVAL;
+
+	/* Guest map calls currently complete at most one page at a time. */
+	if (vm_handle > INT_MAX ||
+	    host_mc->count > __pkvm_pgtable_max_pages(1))
+		return -EINVAL;
+	vm = pkvm_get_vm(vm_handle);
+	if (!vm)
+		return -EINVAL;
+	if (!pkvm_is_protected_vm(&vm->kvm) || !vm->dma_domain)
+		goto put_vm;
+
+	domain = __pkvm_get_iommu_domain(vm->dma_domain->pgd);
+	if (!domain)
+		goto put_vm;
+	if (domain->owner_vm != vm) {
+		ret = -EPERM;
+		goto put_domain;
+	}
+
+	/* DMA tables belonging to a guest remain private to hyp. */
+	host_mc->flags &= ~PKVM_MC_DONATE_SHARE_RO;
+	ret = pkvm_refill_memcache(&incoming, host_mc->count, host_mc);
+
+	/* Donation takes ownership locks; merge only after dropping them. */
+	pkvm_spin_lock(&domain->lock);
+	while ((page = pop_pkvm_memcache_page(&incoming, pkvm_phys_to_virt)))
+		push_pkvm_memcache_page(&domain->mc, page, pkvm_virt_to_phys);
+	pkvm_spin_unlock(&domain->lock);
+	/* Keep successfully donated pages even if a later donation failed. */
+put_domain:
+	pkvm_put_iommu_domain(domain);
+put_vm:
+	pkvm_put_vm(vm);
+	return ret;
+}
+
+int pkvm_guest_iommu_domain_map(struct pkvm_vm *vm, u64 iova, u64 gpa, u64 size,
+				u64 prot, u64 *mapped,
+				unsigned long *need_mc_pages)
+{
+	struct domain_map_data d = { 0 };
+	unsigned long phys;
+	int ret;
+
+	*mapped = 0;
+	*need_mc_pages = 0;
+	if (!size || !IS_ALIGNED(iova | gpa | size, VTD_PAGE_SIZE) ||
+	    iova + size < iova || gpa + size < gpa)
+		return -EINVAL;
+	/* We accept IOMMU_CACHE, because ordinary DMA on x86 is coherent. */
+	if (!(prot & (IOMMU_READ | IOMMU_WRITE)) ||
+	    (prot & ~(IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE)))
+		return -EINVAL;
+	if (!vm->dma_domain)
+		return -ENODEV;
+
+	/* One-page completion avoids partial progress within a refill retry. */
+	ret = pkvm_guest_pin_dma_page(vm, gpa, &phys);
+	if (ret)
+		return ret;
+
+	d.pgd_gpa = pkvm_virt_to_host_gpa(vm->dma_domain->pgd);
+	d.iov_pfn = iova >> VTD_PAGE_SHIFT;
+	d.phys_pfn = phys >> VTD_PAGE_SHIFT;
+	if (prot & IOMMU_READ)
+		d.prot |= DMA_PTE_READ;
+	if (prot & IOMMU_WRITE)
+		d.prot |= DMA_PTE_WRITE;
+	d.nr_pages = 1;
+	ret = iommu_domain_map(&d, vm, need_mc_pages);
+	if (ret)
+		pkvm_guest_unuse_dma(phys, PAGE_SIZE);
+	else
+		*mapped = PAGE_SIZE;
+	return ret;
+}
+
+int pkvm_guest_iommu_domain_unmap(struct pkvm_vm *vm, u64 iova, u64 size,
+				  u64 *unmapped)
+{
 	struct dmar_domain *domain;
 	int ret;
 
-	pkvm_warn("%s: phys=%llx pgd_gpa=0x%llx did=%d\n", __func__, phys, pgd_gpa, did);
-
-	if (!iommu) {
-		pkvm_err("%s: failed to get the iommu [phys:%llx]\n", __func__,
-			 phys);
+	*unmapped = 0;
+	if (!size || !IS_ALIGNED(iova | size, VTD_PAGE_SIZE) ||
+	    iova + size < iova)
 		return -EINVAL;
-	}
+	if (!vm->dma_domain)
+		return -ENODEV;
 
-	domain = get_host_iommu_domain(pkvm_host_gpa_to_virt(pgd_gpa));
-	if (!domain) {
-		pkvm_err("%s: failed to get the domain [pgd:%llx]\n", __func__,
-			 pgd_gpa);
-		return -EINVAL;
-	}
-
-	if (!iommu_domain_compatible(iommu, domain)) {
-		pkvm_err("%s: domain[pgd:%llx] is incompatible with iommu%d\n", __func__, pgd_gpa, iommu->seq_id);
-		pkvm_put_iommu_domain(domain);
-		return -EINVAL;
-	}
-
-	ret = pkvm_iommu_free_did(iommu, domain, did);
+	domain = __pkvm_get_iommu_domain(vm->dma_domain->pgd);
+	if (!domain)
+		return -ENODEV;
+	pkvm_spin_lock(&domain->lock);
+	if (domain->owner_vm != vm)
+		ret = -EPERM;
+	else if (domain->agaw < 0)
+		ret = -ENODEV;
+	else if (iova > __DOMAIN_MAX_ADDR(domain->gaw))
+		ret = -EINVAL;
+	else
+		ret = domain_unmap_page(domain, iova >> VTD_PAGE_SHIFT);
+	if (!ret)
+		*unmapped = PAGE_SIZE;
+	pkvm_spin_unlock(&domain->lock);
 	pkvm_put_iommu_domain(domain);
-	if (ret > 0) {
-		/* did is still attached, this is a bug */
-		pkvm_err("%s: failed to free did, still users: %d\n", __func__, ret);
-		return -EBUSY;
-	}
-
 	return ret;
 }

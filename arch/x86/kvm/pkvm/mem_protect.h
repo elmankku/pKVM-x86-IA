@@ -4,6 +4,8 @@
 
 #include <linux/log2.h>
 
+struct pkvm_vm;
+
 /**
  * enum pkvm_page_state - Track how a page is owned and mapped among page tables
  * @PKVM_PAGE_OWNED:		The page is mapped in this page table [*] and
@@ -106,6 +108,9 @@ int pkvm_guest_share_host(struct kvm_vcpu *vcpu, unsigned long gpa,
 			  unsigned long size, unsigned long *need_mc_pages);
 int pkvm_guest_unshare_host(struct kvm_vcpu *vcpu, unsigned long gpa,
 			    unsigned long size, unsigned long *need_mc_pages);
+int pkvm_guest_pin_dma_page(struct pkvm_vm *vm, unsigned long gpa,
+			    unsigned long *phys);
+void pkvm_guest_unuse_dma(unsigned long phys, unsigned long size);
 int pkvm_host_use_dma(unsigned long phys, unsigned long size);
 void pkvm_host_unuse_dma(unsigned long phys, unsigned long size);
 

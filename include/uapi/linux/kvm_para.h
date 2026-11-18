@@ -40,6 +40,9 @@
 #define PKVM_GHC_IOREAD			PKVM_GHC_NUM(3)
 #define PKVM_GHC_IOWRITE		PKVM_GHC_NUM(4)
 #define PKVM_GHC_START_CPU		PKVM_GHC_NUM(5)
+#define PKVM_GHC_IOMMU_MAP		PKVM_GHC_NUM(6)
+#define PKVM_GHC_IOMMU_UNMAP		PKVM_GHC_NUM(7)
+#define PKVM_GHC_IOMMU_GET_IOVA_BITS	PKVM_GHC_NUM(8)
 
 /*
  * hypercalls use architecture specific
