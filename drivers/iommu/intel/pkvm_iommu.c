@@ -11,6 +11,56 @@
 #include "pasid.h"
 #include "../iommu-pages.h"
 
+int pkvm_host_device_iommu_phys(struct device *dev, u64 *iommu_phys)
+{
+	struct device_domain_info *info;
+
+	if (!dev->iommu || !dev->iommu->iommu_dev ||
+	    dev->iommu->iommu_dev->ops != &intel_iommu_ops)
+		return -ENODEV;
+
+	info = dev_iommu_priv_get(dev);
+	if (!info || !info->iommu)
+		return -ENODEV;
+
+	*iommu_phys = info->iommu->reg_phys;
+	return 0;
+}
+
+/* Caller holds the IOMMU group mutex to stabilize the host attachment. */
+int pkvm_host_restore_device_context(struct device *dev)
+{
+	struct device_domain_info *info;
+	phys_addr_t pgd = 0;
+	u16 did = FLPT_DEFAULT_DID;
+
+	if (!dev->iommu || !dev->iommu->iommu_dev ||
+	    dev->iommu->iommu_dev->ops != &intel_iommu_ops)
+		return -ENODEV;
+
+	info = dev_iommu_priv_get(dev);
+	if (!info || !info->iommu)
+		return -ENODEV;
+	if (sm_supported(info->iommu) || dev_is_real_dma_subdevice(dev))
+		return -EOPNOTSUPP;
+
+	/* A host blocking domain needs the context to remain absent. */
+	if (!info->domain_attached)
+		return 0;
+
+	/* Attached without a paging domain means the host identity domain. */
+	if (info->domain) {
+		if (!intel_domain_is_ss_paging(info->domain))
+			return -EOPNOTSUPP;
+		pgd = virt_to_phys(info->domain->pgd);
+		did = domain_id_iommu(info->domain, info->iommu);
+	}
+
+	/* Replay the binding; the host domain and DID are still attached. */
+	return pkvm_context_mapping(info->iommu, info, info->bus, info->devfn,
+				    pgd, did);
+}
+
 int __init pkvm_host_prepare_iommu(void)
 {
 	struct dmar_drhd_unit *drhd;

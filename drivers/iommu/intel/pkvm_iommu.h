@@ -125,6 +125,8 @@ static inline void pkvm_writel(void __iomem *reg, unsigned long reg_phys,
 
 int __init pkvm_scan_satc_devs(u16 satc_devs[], int *nr_satc_devs, int max_satc_devs);
 
+int pkvm_host_device_iommu_phys(struct device *dev, u64 *iommu_phys);
+int pkvm_host_restore_device_context(struct device *dev);
 int __init pkvm_host_prepare_iommu(void);
 int __init pkvm_host_init_iommu(void);
 

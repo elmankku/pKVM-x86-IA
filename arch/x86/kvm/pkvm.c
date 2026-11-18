@@ -4,9 +4,13 @@
 #include <linux/kvm_host.h>
 #include <linux/memblock.h>
 #include <linux/module.h>
+#include <linux/iommu.h>
+#include <linux/pci.h>
+#include <linux/pm_runtime.h>
 #include <linux/sort.h>
 #include <asm/e820/api.h>
 #include <asm/kvm_pkvm.h>
+#include "pkvm_iommu.h"
 
 /* Kernel command-line parameter */
 bool __read_mostly enable_pkvm;
@@ -401,4 +405,157 @@ int __init pkvm_gsmi_init(void)
 	pkvm_sym(pkvm_gsmi_mem_size) = pkvm_mem32_size;
 
 	return 0;
+}
+
+struct pkvm_assign_group_data {
+	struct kvm *kvm;
+	int group_id;
+};
+
+static int pkvm_check_dma_alias(struct pci_dev *pdev, u16 alias, void *data)
+{
+	struct pci_dev *assigned = data;
+
+	/* This prototype programs only the assigned function's own RID. */
+	return alias == PCI_DEVID(assigned->bus->number, assigned->devfn) ?
+		       0 :
+		       -EOPNOTSUPP;
+}
+
+static int pkvm_vm_assign_device(struct device *dev, void *data)
+{
+	struct pkvm_assign_group_data *assign = data;
+	struct pci_dev *pdev;
+	u64 iommu_phys;
+	u16 devid, command;
+	int ret;
+
+	if (!dev_is_pci(dev))
+		return 0;
+
+	pdev = to_pci_dev(dev);
+	/* The current assignment ABI identifies devices within segment zero. */
+	if (pci_domain_nr(pdev->bus))
+		return -EOPNOTSUPP;
+	ret = pci_for_each_dma_alias(pdev, pkvm_check_dma_alias, pdev);
+	if (ret)
+		return ret;
+	devid = PCI_DEVID(pdev->bus->number, pdev->devfn);
+
+	ret = pkvm_host_device_iommu_phys(dev, &iommu_phys);
+	if (ret)
+		return ret;
+
+	/* GROUP_ADD precedes VFIO's open_device(), which normally does this. */
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		return ret;
+
+	pci_clear_master(pdev);
+	ret = pci_read_config_word(pdev, PCI_COMMAND, &command);
+	if (ret) {
+		ret = pcibios_err_to_errno(ret);
+		goto out_pm;
+	}
+	if (PCI_POSSIBLE_ERROR(command)) {
+		pci_err(pdev, "pKVM assignment: PCI command register inaccessible\n");
+		ret = -ENODEV;
+		goto out_pm;
+	}
+	if (command & PCI_COMMAND_MASTER) {
+		pci_err(pdev, "pKVM assignment: bus mastering remains enabled\n");
+		ret = -EBUSY;
+		goto out_pm;
+	}
+	if (!pci_wait_for_pending_transaction(pdev)) {
+		pci_err(pdev, "pKVM assignment: pending transactions did not drain\n");
+		ret = -ETIMEDOUT;
+		goto out_pm;
+	}
+
+	ret = pkvm_hypercall(vm_assign_device, assign->kvm->arch.pkvm.handle,
+			     devid, assign->group_id, iommu_phys);
+	WARN_ONCE(ret, "pkvm assign device 0x%x failed, err = %d\n", devid,
+		  ret);
+
+out_pm:
+	pm_runtime_put(dev);
+	return ret;
+}
+
+static int pkvm_vm_reclaim_device(struct device *dev, struct kvm *kvm)
+{
+	struct pci_dev *pdev;
+	u16 devid;
+	int ret;
+
+	if (!dev_is_pci(dev))
+		return 0;
+
+	pdev = to_pci_dev(dev);
+	if (pci_domain_nr(pdev->bus))
+		return -EOPNOTSUPP;
+
+	ret = pci_for_each_dma_alias(pdev, pkvm_check_dma_alias, pdev);
+	if (ret)
+		return ret;
+
+	devid = PCI_DEVID(pdev->bus->number, pdev->devfn);
+
+	ret = pkvm_hypercall(vm_reclaim_device, kvm->arch.pkvm.handle, devid);
+	if (ret && ret != -ENODEV)
+		return ret;
+
+	/* Also retry restoration if a previous reclaim already detached it. */
+	return pkvm_host_restore_device_context(dev);
+}
+
+struct pkvm_reclaim_group_data {
+	struct kvm *kvm;
+	int error;
+};
+
+static int pkvm_vm_reclaim_device_cb(struct device *dev, void *data)
+{
+	struct pkvm_reclaim_group_data *reclaim = data;
+	int ret = pkvm_vm_reclaim_device(dev, reclaim->kvm);
+
+	if (ret && !reclaim->error)
+		reclaim->error = ret;
+
+	/* Attempt every member, even if an earlier reclaim failed. */
+	return 0;
+}
+
+int kvm_arch_assign_group(struct iommu_group *group, struct kvm *kvm)
+{
+	struct pkvm_assign_group_data assign = {
+		.kvm = kvm,
+	};
+	int ret;
+
+	if (!pkvm_is_protected_vm(kvm))
+		return 0;
+
+	/* Protected device assignment currently requires a VFIO group FD. */
+	if (!group)
+		return -ENOTSUPP;
+
+	assign.group_id = iommu_group_id(group);
+	ret = iommu_group_for_each_dev(group, &assign, pkvm_vm_assign_device);
+	if (ret)
+		WARN_ON(kvm_arch_reclaim_group(group, kvm));
+
+	return ret;
+}
+
+int kvm_arch_reclaim_group(struct iommu_group *group, struct kvm *kvm)
+{
+	struct pkvm_reclaim_group_data reclaim = { .kvm = kvm };
+
+	if (!pkvm_is_protected_vm(kvm))
+		return 0;
+
+	iommu_group_for_each_dev(group, &reclaim, pkvm_vm_reclaim_device_cb);
+	return reclaim.error;
 }

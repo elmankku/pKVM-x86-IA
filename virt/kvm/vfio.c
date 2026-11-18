@@ -80,7 +80,6 @@ static bool kvm_vfio_file_is_valid(struct file *file)
 	return ret;
 }
 
-#ifdef CONFIG_SPAPR_TCE_IOMMU
 static struct iommu_group *kvm_vfio_file_iommu_group(struct file *file)
 {
 	struct iommu_group *(*fn)(struct file *file);
@@ -97,6 +96,7 @@ static struct iommu_group *kvm_vfio_file_iommu_group(struct file *file)
 	return ret;
 }
 
+#ifdef CONFIG_SPAPR_TCE_IOMMU
 static void kvm_spapr_tce_release_vfio_group(struct kvm *kvm,
 					     struct kvm_vfio_file *kvf)
 {
@@ -140,6 +140,43 @@ static void kvm_vfio_update_coherency(struct kvm_device *dev)
 	}
 }
 
+int __weak kvm_arch_assign_group(struct iommu_group *group, struct kvm *kvm)
+{
+	return 0;
+}
+
+int __weak kvm_arch_reclaim_group(struct iommu_group *group, struct kvm *kvm)
+{
+	return 0;
+}
+
+static int kvm_vfio_assign_file(struct file *file, struct kvm *kvm)
+{
+	struct iommu_group *group;
+	int ret;
+
+	group = kvm_vfio_file_iommu_group(file);
+
+	/* Device FDs have no group here; the architecture decides support. */
+	ret = kvm_arch_assign_group(group, kvm);
+	if (group)
+		iommu_group_put(group);
+
+	return ret;
+}
+
+static void kvm_vfio_reclaim_file(struct file *file, struct kvm *kvm)
+{
+	struct iommu_group *group;
+
+	group = kvm_vfio_file_iommu_group(file);
+	if (!group)
+		return;
+
+	WARN_ON(kvm_arch_reclaim_group(group, kvm));
+	iommu_group_put(group);
+}
+
 static int kvm_vfio_file_add(struct kvm_device *dev, unsigned int fd)
 {
 	struct kvm_vfio *kv = dev->private;
@@ -169,6 +206,12 @@ static int kvm_vfio_file_add(struct kvm_device *dev, unsigned int fd)
 	kvf = kzalloc(sizeof(*kvf), GFP_KERNEL_ACCOUNT);
 	if (!kvf) {
 		ret = -ENOMEM;
+		goto out_unlock;
+	}
+
+	ret = kvm_vfio_assign_file(filp, dev->kvm);
+	if (ret) {
+		kfree(kvf);
 		goto out_unlock;
 	}
 
@@ -207,6 +250,7 @@ static int kvm_vfio_file_del(struct kvm_device *dev, unsigned int fd)
 #ifdef CONFIG_SPAPR_TCE_IOMMU
 		kvm_spapr_tce_release_vfio_group(dev->kvm, kvf);
 #endif
+		kvm_vfio_reclaim_file(kvf->file, dev->kvm);
 		kvm_vfio_file_set_kvm(kvf->file, NULL);
 		fput(kvf->file);
 		kfree(kvf);
@@ -330,6 +374,7 @@ static void kvm_vfio_release(struct kvm_device *dev)
 #ifdef CONFIG_SPAPR_TCE_IOMMU
 		kvm_spapr_tce_release_vfio_group(dev->kvm, kvf);
 #endif
+		kvm_vfio_reclaim_file(kvf->file, dev->kvm);
 		kvm_vfio_file_set_kvm(kvf->file, NULL);
 		fput(kvf->file);
 		list_del(&kvf->node);

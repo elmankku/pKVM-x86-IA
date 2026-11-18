@@ -2614,4 +2614,7 @@ static inline int kvm_enable_virtualization(void) { return 0; }
 static inline void kvm_disable_virtualization(void) { }
 #endif
 
+int kvm_arch_assign_group(struct iommu_group *group, struct kvm *kvm);
+int kvm_arch_reclaim_group(struct iommu_group *group, struct kvm *kvm);
+
 #endif
