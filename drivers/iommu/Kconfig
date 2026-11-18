@@ -359,6 +359,15 @@ config HYPERV_IOMMU
 	  Stub IOMMU driver to handle IRQs to support Hyper-V Linux
 	  guest and root partitions.
 
+config PKVM_X86_GUEST_IOMMU
+	bool "pKVM x86 protected guest IOMMU driver"
+	depends on PKVM_X86_GUEST && PCI
+	select IOMMU_API
+	help
+	  Para-virtualized IOMMU driver for protected pKVM x86 guests.
+
+	  If unsure, say N here.
+
 config VIRTIO_IOMMU
 	tristate "Virtio IOMMU driver"
 	depends on VIRTIO

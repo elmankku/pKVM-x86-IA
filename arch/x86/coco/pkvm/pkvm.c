@@ -2,6 +2,10 @@
 
 #include <linux/kvm_para.h>
 #include <linux/virtio_balloon.h>
+#include <linux/mm.h>
+#include <linux/highmem.h>
+#include <linux/memremap.h>
+#include <linux/dma-map-ops.h>
 #include <asm/coco.h>
 #include <asm/pkvm_guest.h>
 #include <asm/pgtable.h>
@@ -42,6 +46,73 @@ int pkvm_set_mem_host_visibility(unsigned long addr, int numpages, bool enc)
 	}
 
 	return ret;
+}
+
+int pkvm_guest_iommu_get_iova_bits(void)
+{
+	if (!pkvm_is_protected_guest())
+		return -EOPNOTSUPP;
+
+	return kvm_hypercall0(PKVM_GHC_IOMMU_GET_IOVA_BITS);
+}
+
+static int pkvm_iommu_hypercall(unsigned int nr, unsigned long a0,
+				unsigned long a1, unsigned long a2,
+				unsigned long a3, size_t *done)
+{
+	unsigned long status = nr;
+	unsigned long bytes = a2;
+
+	asm volatile(KVM_HYPERCALL
+		     : "+a"(status), "+d"(bytes)
+		     : "b"(a0), "c"(a1), "S"(a3)
+		     : "memory");
+	*done = bytes;
+	return (int)status;
+}
+
+// FIXME: hyp to handle donation.
+static void pkvm_touch_pages(phys_addr_t phys, size_t size)
+{
+	while (size) {
+		struct page *page = phys_to_page(phys);
+		size_t offset = offset_in_page(phys);
+		size_t len = min_t(size_t, size, PAGE_SIZE - offset);
+		u8 *vaddr;
+
+		if (is_pci_p2pdma_page(page))
+			return;
+
+		/* Trigger lazy donation before mapping this page for DMA. */
+		vaddr = kmap_local_page(page);
+		(void)READ_ONCE(vaddr[offset]);
+		kunmap_local(vaddr);
+
+		phys += len;
+		size -= len;
+	}
+}
+
+int pkvm_guest_iommu_map(unsigned long iova, phys_addr_t gpa, size_t size,
+			 int prot, size_t *mapped)
+{
+	*mapped = 0;
+	if (!IS_ENABLED(CONFIG_X86_64) || !pkvm_is_protected_guest())
+		return -EOPNOTSUPP;
+
+	/* HACK: touch pages before map to ensure pages are donated */
+	pkvm_touch_pages(gpa, size);
+
+	return pkvm_iommu_hypercall(PKVM_GHC_IOMMU_MAP, iova, gpa, size, prot, mapped);
+}
+
+int pkvm_guest_iommu_unmap(unsigned long iova, size_t size, size_t *unmapped)
+{
+	*unmapped = 0;
+	if (!IS_ENABLED(CONFIG_X86_64) || !pkvm_is_protected_guest())
+		return -EOPNOTSUPP;
+
+	return pkvm_iommu_hypercall(PKVM_GHC_IOMMU_UNMAP, iova, size, 0, 0, unmapped);
 }
 
 static int pkvm_virt_mmio(int size, bool write, unsigned long vaddr, unsigned long *val)
